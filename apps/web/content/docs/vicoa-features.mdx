@@ -1,0 +1,555 @@
+---
+title: Vicoa Features
+description: Learn how to use Vicoa features including slash commands, permission modes, dictation, and cross-device workflows
+---
+
+# Vicoa Features Guide
+Master Vicoa's powerful features for seamless coding across all your devices
+
+## Updating to the Latest Version
+
+### Update Vicoa CLI
+
+Keep your CLI up to date to access the latest features and improvements:
+
+```bash
+npm i -g @vicoa/cli@latest
+```
+
+To check your current version:
+
+```bash
+vicoa --version
+```
+
+### Download Latest App
+
+Always use the latest version of the Vicoa app for the best experience:
+
+- **iOS App**: [Download from App Store](http://apps.apple.com/sg/app/id6751626168)
+- **Android App**: [Download from Google Play](https://play.google.com/store/apps/details?id=app.vicoa)
+- **Web App**: Visit [https://vicoa.ai](https://vicoa.ai)
+
+## Fuzzy Search for Files
+
+Use the @ key to fuzzy search for files in the project across web, mobile, and CLI.
+
+### How to Use
+
+Type `@` followed by a file path to mention a file in your message, e.g., 
+
+```
+@src/components/Button.tsx help me refactor this component
+```
+
+### Multiple File References
+
+Reference multiple files in a single message, e.g.,
+
+```
+@src/app.ts @src/config.ts these files need to work together
+```
+
+### Benefits
+
+- Give Claude Code immediate context about specific files
+- Faster than asking Claude to search for files
+- No need to remember exact file names
+- Perfect for targeted refactoring, debugging, or code reviews
+
+## Reference Sessions, Tasks and Automations
+
+Use the # key to pull another part of your workspace into the chat: a running session, a task, or an automation. Where @ reaches into your files, # reaches into Vicoa itself.
+
+Available in the web app and the desktop app.
+
+### How to Use
+
+Type `#` in the message box and start typing a name. The panel lists your running sessions, open tasks, and enabled automations, e.g.
+
+```
+continue from #zesty-quartz, it left the migration half applied
+```
+
+Press `#` on its own to see the most recent of each without typing. Pick a row with Enter or a click. You can also open the picker from the "+" button next to the message box, under **Reference a session or task**.
+
+### What the Agent Receives
+
+The token stays in your message, and Vicoa appends a short block underneath with the details the agent needs:
+
+```
+Task VIC-42: Fix the diff editor
+status: in_progress · priority: high · project: Vicoa
+Live record: `vicoa task get VIC-42`
+Description: ...
+```
+
+A session reference carries the facts that identify the run, its agent, folder and worktree, plus the command to read the transcript. An automation carries its schedule and its prompt. Every block ends with the `vicoa` command for the full record, so the agent can dig further on its own instead of asking you to paste more.
+
+### Referencing a Task Files the Session Under It
+
+Reference a task and the session joins that task's **Sessions** list, and the task moves to *In Progress*. The message box says so before you send:
+
+> Sending files this session under Fix the diff editor
+
+A session belongs to one task at a time. If it already belongs to one, referencing another task still hands the agent that task's details, but leaves the filing alone, so nothing moves on your board by surprise.
+
+### Removing a Reference
+
+Delete the `#token` from your message. The details attached to it go too.
+
+### Benefits
+
+- Hand one agent the context of another without copying and pasting
+- Point an agent at a task without retyping the description you already wrote
+- Keep the board honest, since work started from a task ends up filed under it
+
+## Slash Commands
+
+Access powerful commands quickly by typing `/` in the chat interface.
+
+### How to Use
+
+Simply type `/` in your chat to see available slash commands. Slash commands work on web, mobile, and CLI.
+
+### Available Commands
+
+- **Agent-specific commands**: All built-in slash commands from Claude Code, Codex, or OpenCode
+- **Custom commands**: Access your custom commands from `~/.claude/commands` (Claude Code) or `~/.config/opencode/commands` (OpenCode)
+- Works seamlessly across all platforms (desktop, web, mobile)
+
+### Benefits
+
+- Quick access to frequently used workflows
+- Consistent command interface across all devices
+- Support for both built-in and custom commands
+
+## Permission Modes
+
+Switch between different permission modes directly from mobile or web to control how Claude Code operates.
+
+### Available Modes
+
+- **Plan Mode**: Claude will plan changes before executing
+- **Accept Edits**: Review and approve each edit before it's applied
+- **Bypass Permissions**: Let Claude work autonomously with minimal interruptions (coming soon)
+
+### Switch Modes Anywhere
+
+Change permission modes from any device:
+- Toggle settings from mobile app
+- Switch modes from web interface
+- Configure from CLI
+
+### When to Use Each Mode
+
+- **Plan Mode**: When exploring new code or working on complex features
+- **Accept Edits**: For careful review of changes to critical files
+- **Bypass Permissions**: When iterating quickly on familiar code
+
+## Thinking Toggle
+
+Control whether you see Claude's thinking process or just the final output.
+
+### Toggle Thinking
+
+- **Enable**: See Claude's reasoning and thought process
+- **Disable**: View only the final results for a cleaner interface
+- **Change anytime**: Switch on mobile, web, or CLI
+
+### Why Use It
+
+- **Enable for learning**: Understand how Claude approaches problems
+- **Disable for speed**: Focus on results without intermediate steps
+
+## Agent Selection
+
+Vicoa supports Claude Code, Codex, and OpenCode, allowing you to switch between agents with a single command.
+
+### Available Agents
+
+- **Claude Code**: Anthropic's AI coding agent
+- **Codex**: OpenAI's coding agent
+- **OpenCode**: an open source AI coding agent
+- **300+ models**: Use free or alternative models via OpenRouter, Kimi K2, and more
+
+### Switch Agents
+
+```bash
+# Set Claude Code as default
+vicoa --set-default claude
+
+# Set Codex as default
+vicoa --set-default codex
+
+# Set OpenCode as default
+vicoa --set-default opencode
+
+# Start with specific agent
+vicoa codex
+vicoa opencode
+```
+
+### Use Alternative Models
+
+Configure Claude Code to use free models or 300+ models from 60+ providers. Learn more in our [Alternative Models guide](/docs/alternative-models).
+
+**Popular options:**
+- **Free models and pay-per-use models** via OpenRouter
+- **Kimi K2** with 200K+ context window
+
+### Session Filtering
+
+Filter your sessions by:
+- **Agent type**: View only Claude Code, Codex, or OpenCode sessions
+- **Status**: Active, completed, or interrupted sessions
+- **Date**: Find sessions from specific time periods
+
+## Start Agents from Anywhere
+
+Launch Claude Code, Codex, or OpenCode sessions directly from your mobile or web interface. No need to wait until you're back at your desktop.
+
+### How It Works
+
+1. Open Vicoa on mobile or web
+2. Tap to start a new agent session
+3. The session starts on your connected machine
+4. Continue working from any device
+
+
+## Interrupt Agent Execution
+
+Stop agent execution at any time with a single click.
+
+### How to Interrupt
+
+- **Mobile**: Tap the interrupt button during execution
+- **Web**: Click the interrupt button in the interface
+- **Works instantly**: Stops the current operation immediately
+
+### When to Use
+
+- The agent is going in the wrong direction
+- Need to provide additional context
+- Want to change approach during execution
+
+
+## Talk to Code (Dictation)
+
+Convert your voice to text for hands-free coding on mobile.
+
+### How to Use
+
+1. Tap the microphone icon in the chat
+2. Speak your message naturally
+3. Voice converts to text instantly
+4. Send or edit before sending
+
+### Perfect For
+
+- Coding while commuting
+- Quick ideas on the go
+- Hands-free workflow on mobile
+
+## Message Management
+
+### Share Chat Messages
+
+Copy individual or multiple messages to share with your team.
+
+**How to share:**
+1. Long-press a message to select
+2. Select additional messages if needed
+3. Tap copy to share
+
+**Use cases:**
+- Share solutions with teammates
+- Document AI-generated code
+- Save useful responses for reference
+
+### Unseen Messages Navigation
+
+Never lose your place in long conversations.
+
+**Features:**
+- Chat scrolling that doesn't auto-jump to bottom
+- "Jump to unseen messages" button
+- Read older messages without losing context
+
+### Draft Message Retention
+
+Unfinished messages automatically save as drafts.
+
+**Benefits:**
+- Pause and continue conversations later
+- Never lose partially written prompts
+- Think through complex questions at your own pace
+
+## Session Organization
+
+### Session Renaming
+
+Rename sessions for better organization and quick identification.
+
+**How to rename:**
+1. Open session settings
+2. Enter a descriptive name
+3. Find sessions faster in your history
+
+### Session Filters
+
+Find the right session quickly with advanced filtering:
+- Filter by agent (Claude Code, Codex, or OpenCode)
+- Filter by status (active, completed, interrupted)
+- Filter by date range
+
+## Share Sessions and Projects with a Link
+
+Share a session's transcript, or a whole project (its tasks, its sessions,
+its automations, or any mix of them) with anyone. No Vicoa account needed to
+read it.
+
+**Where to find it:**
+- The **Share** button in a session's header, next to the files panel toggle
+- A session's **⋯** menu (session header, sidebar or Kanban card) → **Share**
+- A project's **⋯** menu in the sidebar → **Share project…**
+- The Tasks page, with a project selected → **Share**
+
+A project is one link with a content selection: **What this link shares** has
+a switch each for **Tasks**, **Sessions** and **Automations**, and where you
+opened the dialog only decides which one starts on (**Automations** always
+starts off, so publishing them is a choice you make). The dialog opens on the link itself:
+the first time, pick what it carries, who can open it and when it expires,
+then press **Create link**; it is copied for you. Every time after that the
+existing link is right there with a **Copy link** button; use **New link**
+for one with different settings. Links look like `vicoa.ai/share/…`.
+
+**What a link can do:**
+- **Follow along live.** Viewers see the transcript as it grows, or the board
+  as tasks move. They watch; they don't prompt the session or edit tasks. The
+  one opt-in is *Allow comments* on a link that carries tasks, which lets
+  signed-in Vicoa users comment on tasks under their own name, whoever the
+  link is for; a visitor who is not signed in is asked to sign in first.
+- **Show automations.** A link that carries them lists what each automation
+  asks the agent to do, which agent and model it uses, when it runs and how
+  its last run went. It never shows who wrote one or which machine it runs on.
+- **Audience:** *Anyone with the link* (no account) or *Vicoa users only*.
+  Someone who opens a *Vicoa users only* link while signed out sees "This
+  link isn't available" with a sign-in button; the link works once they sign
+  in.
+- **Expiry:** never, or 1 / 7 / 30 / 90 days. Revoke a link at any time from
+  the same dialog; it stops working immediately, for everyone.
+- **Filters:** each half narrows on its own: *Filter tasks* by status or
+  label, *Filter sessions* by date range. Filters apply live, so new matches
+  appear too.
+
+**What the page says about you.** By default a shared page shows the work
+and nothing about who shared it: no name, no avatar, no branch names. Two
+switches under *Viewers can see* turn those on per link: **My name and
+avatar** puts them on the page, **Branch names** shows each session's
+worktree branch. With the first one off, the page calls you "Owner" wherever
+you appear (as a task's assignee, in its activity, on your comments), with
+a plain placeholder for the avatar.
+
+**What viewers see.** The page looks like Vicoa: a project link's tasks are
+the sidebar's **Tasks** row, its sessions are the list underneath, and
+picking either opens it on the right. A session shows a **Live** dot while
+its agent is working,
+and every viewer sees new messages within seconds. Viewers who are signed in
+to Vicoa get an **Open in Vicoa** button; everyone else gets **Log in** and
+**Sign up for free**.
+
+**It is a live view.** A link shared during a session keeps showing whatever
+happens next until you revoke it.
+
+<Callout type="warn">
+Anyone with this link can read the full transcript, including any file
+contents or credentials the agent printed. Vicoa does not redact transcripts, so
+check what the agent saw before sharing.
+</Callout>
+
+## Share with People and Teams
+
+A link is for anyone. To give specific people access, open the same share
+dialog and switch to its **People** tab.
+
+**Share a project.** Enter an email address (or pick one of your teams), pick
+a role, choose what they see (**Tasks**, **Sessions** and **Automations**; all
+three to start with), then press **Invite**. The project appears in their sidebar under **Shared with
+me**. If they don't have a Vicoa account yet, the access waits for them and
+attaches when they sign up with that address.
+
+| Role | Can |
+|---|---|
+| Viewer | Read the task board and the shared sessions |
+| Commenter | Also comment and react on tasks |
+| Editor | Also create and edit tasks |
+| Admin | Also manage who has access |
+
+Change someone's role, narrow what they see, or remove them from the **⋯**
+menu on their row. Changes apply immediately. Only admins and the owner see
+the People tab, and only they see people's email addresses. With a project
+selected, the Tasks page shows who it is shared with next to **Share**.
+
+**Your own sessions in a shared project.** Being given access doesn't move
+your work. If a project is shared with you as an editor, the sessions you
+start in that repository stay in your own projects until you choose **Add to
+sidebar** from the project's **⋯** menu under **Shared with me**. After that,
+new sessions there are filed under the shared project, where the people on it
+can see them. Linking one of your folders to the project does the same, and
+**Remove from sidebar** stops it. Projects owned by a team you're on take
+your sessions without this step.
+
+**Share one session.** A session's People tab shares just that session,
+as a viewer (reads it) or an editor. It also shows how many people already
+see the session through its project.
+
+**What they see.** Shared sessions open read-only, without the terminal,
+files or git panels, and without anything that reaches your machine. They
+refresh on their own every few seconds. A board shared below editor shows
+its tasks but not the controls that change them. Someone who no longer
+wants a project in their sidebar can choose **Leave project** from its **⋯**
+menu.
+
+**Automations.** People whose access includes **Automations** can read the
+automations that run in the project. The **Automations** page lists every
+automation you can see, grouped by project: yours, and other people's in the
+projects shared with you, each with its author's picture. Pick a project in the
+menu at the top (or, for a project shared with you, choose **Automations** from
+its **⋯** menu in the sidebar) to see just that one. Opening someone else's shows what it asks the
+agent to do, which agent and model it uses, its schedule and its run history. An automation belongs to a project when its
+folder is inside the project's folder on the machine it runs on. Only the
+person who created an automation can edit, run, pause or delete it, because
+each run starts an agent on their machine. A session started by an automation
+names it in its header, and the `vicoa` CLI lists only your own automations.
+Access given before automations could be shared doesn't include them; add
+them from the **⋯** menu on that person's row.
+
+### Teams
+
+A team is a group of people you can share with in one step. Create one in
+**Settings → Teams**, then invite people by email or with an invite link
+(choose the role, when it expires and how many times it can be used). An
+invitation shows up in the invitee's account menu and in **Settings → Teams**,
+with **Join** and **Decline**. On a server that can't send email, the dialog
+says so and gives you a link to pass on instead.
+
+| Role | Can |
+|---|---|
+| Viewer | See and comment on the team's projects and sessions, but not edit or prompt. Free, and takes no seat |
+| Member | Also edit tasks and labels, prompt sessions and start sessions with the team's agents |
+| Admin | Also invite people and manage the team's projects and agents |
+| Owner | Also change roles, buy seats and hand the team on |
+
+Share a project or a session with a team from the People tab, and everyone on
+the team gets access. People who leave the team lose it. The team's viewers
+read and comment, whatever role the share gives the team.
+
+**Give a project to a team.** Instead of sharing it, a project can belong to
+the team: open its settings (**⋯ → Project settings**, **General**) and choose
+**Move** under **Owner**, or use **Move a project here** on the team's page.
+Everyone on the team then works in it as their own: it sits in their project
+list (not under **Shared with me**), everyone but viewers can edit its tasks
+and prompt its sessions, past ones included, and the team's owner and admins
+manage it. Its tasks, sessions and share links stay attached. Only the
+project's owner can move it, and only the team's owner can move it out again.
+
+Task keys are unique within an owner, so if the team already has a project
+with the same key (say `VIC`), the move asks you for a new one and suggests a
+free one (`VIC2`). The project's labels move into the team's set, matched by
+name.
+
+**Team agents and labels.** A team has its own agents (the saved setups on the
+**Agents** page) and its own label set. Everyone on the team but viewers can
+start sessions with the team's agents and assign them to the team's tasks; only
+the owner and admins create or change them, since their instructions run on
+every member's machine that picks one. Labels on the team's projects come from
+the team's set, which everyone but viewers can edit under **Settings → Tasks**
+or on the team's page.
+
+**The team's page** (**Settings → Teams**, then the team) shows its picture
+(owners and admins can change it), members, projects, agents and labels, its
+invite links, and, for the owner, the seats it takes up. The owner can hand the
+team to another member with **Make owner…** on their row and stays on as an
+admin. Deleting a team gives its projects, agents and labels back to whoever
+created them.
+
+**Seats.** On vicoa.ai, everyone who edits needs a seat: the owner, admins and
+members of a team you own, plus anyone outside it you gave edit access to your
+projects or sessions. A seat is either their own Pro or one you buy for them on
+Vicoa Team. Viewers and commenters are free and unlimited, and someone with
+their own Pro takes no seat. Creating or owning a team takes Pro or Team.
+Invite an editor past the seats you have and Vicoa offers to add a seat right
+there, or to invite them as a viewer instead. If you end up using more seats
+than you have, nobody loses access, but you can't add editors until you add
+seats or remove some. Self-hosted servers have no seat limit.
+
+**Vicoa Team.** Team is $12 per seat per month, or $9 per seat per month billed
+yearly, with a minimum of 2 seats. The team's owner buys them on the **Seats**
+page (**Settings → Billing → Seats**, or from the team's page) and pays for
+everyone from one subscription. Each seat counts as Pro everywhere (desktop,
+web and mobile), and the holder's **Billing** page says which team their seat
+comes from. If you already pay for Pro on the web, upgrading to Team changes
+that subscription in place, prorated, after you confirm. Once nobody else is on
+your seats, you can go back down to 1 seat, which switches you back to Pro for
+just you.
+
+**When Team ends.** A cancelled Team subscription runs to the end of its
+billing period. After that, editors without their own Pro become viewers.
+Nothing is deleted, and editing comes back when you buy seats again, or as soon
+as they get Pro of their own, on the web or in the app.
+
+The `vicoa` CLI lists tasks from your personal projects only; work on a team's
+board from the app.
+
+## View File Changes
+
+See all changed files directly in Vicoa without switching tools.
+
+### How It Works
+
+- All file modifications appear in the interface
+- Review changes on mobile or web
+- No need to switch to your code editor
+- Instant visibility into what Claude changed
+
+### Benefits
+
+- Quick review of modifications
+- Mobile-friendly change viewing
+- Stay in context while reviewing
+
+## Cross-Device Workflow
+
+### Seamless Device Switching
+
+Start coding on your laptop, continue on mobile, finish on the web.
+
+**Features:**
+- Real-time synchronization across all devices
+- Alerts when agent needs input
+- One-tap approval for changes
+- Consistent experience everywhere
+
+
+## Latest Updates
+
+Stay up to date with the latest Vicoa features and improvements:
+
+- [Fuzzy Search for Files with @ in Vicoa](https://updates.vicoa.ai/posts/file-mentions)
+- [View File Changes Directly in Vicoa](https://updates.vicoa.ai/posts/view-file-changes)
+- [Codex Support & Talk to Code (Dictation)](https://updates.vicoa.ai/posts/2-new-updates-to-vibe-code-anywhere)
+- [Share Chat Messages & Improved Layout](https://updates.vicoa.ai/posts/share-chat-messages)
+- [Start Agents from Anywhere & Draft Message Retention](https://updates.vicoa.ai/posts/new-session)
+- [Permission Modes, Thinking Toggle, & Unseen Messages](https://updates.vicoa.ai/posts/new-in-vibe-code-anywhere-permission-modes-thinking-unseen-messages-and-more)
+- [Slash Commands & Interrupt Claude Code](https://updates.vicoa.ai/posts/slash-commands-interrupt)
+
+Subscribe to [Vicoa Updates](https://updates.vicoa.ai/) for the latest feature announcements.
+
+## Need Help?
+
+- Check our [FAQ](/docs/faq) for common questions
+- Review the [troubleshooting guide](/docs/troubleshooting)
+- Join our [Discord community](https://discord.gg/mqz4qRPV4j) for discussions and support
+- Report issues: [GitHub](https://github.com/vicoa-ai/vicoa)
+- Contact support: hi@vicoa.ai

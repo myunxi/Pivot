@@ -1,0 +1,404 @@
+---
+title: Desktop App
+description: Release notes for the Vicoa desktop app (macOS, Windows) — new features, agent support, and fixes shipped in each release.
+---
+
+# Desktop App
+
+### v0.1.38
+8 October, 2026
+- Bundle Vicoa CLI daemon [v1.9.11](/docs/changelog/vicoa-cli#v1911)
+- Run an automation in one of your sessions: its new Runs in row searches your sessions, or keeps New session each run. Each run sends the prompt into that session, resuming it if it has stopped, and Run now continues it
+- A session's header names the automation that runs in it and lists the tasks the session created
+- A task shows which session it was created in, and comments and changes made from a session say "via" that session; only sessions you can open are named
+- A task status chosen in the app or with `vicoa task update` now stays when its linked session starts, ends or is reviewed
+- The account menu shows your name, email and plan: Free with Upgrade, or Pro or Vicoa Team with Manage, which opens Billing in your browser
+- Upgrade opens the pricing page's plan cards in a dialog over the app, so your session list no longer reloads; Teams > Get Pro opens it too
+- Pro users go straight into the app after the setup scan instead of seeing the paywall, and a slow or failed plan check lets you in rather than holding you there
+- The setup paywall no longer offers a free trial, since Pro has none
+
+### v0.1.37
+8 October, 2026
+- Bundle Vicoa CLI daemon [v1.9.10](/docs/changelog/vicoa-cli#v1910)
+- Move a session to another project from its sidebar menu (right-click or the hover menu) or the session header menu: a Project submenu lists the projects you can add sessions to, plus No project, with the current one checked
+- Projects without a chosen image or emoji show a folder icon instead of a colored initial, drawn open while the project's sidebar group is expanded; No project shows a dashed square
+- Project icons no longer flash to the default when you come back from Settings, an uploaded icon loads from disk on the next launch, and an icon change shows everywhere at once
+- The session header's ⋯ menu sits next to Share, hovering the folder chip names the session's project, and the header's tooltips now show in the desktop app
+- Type a task's identifier after `#`, like `#VIC-42`, to reference that task; a partial one such as `vic-4` narrows the list to that project's tasks
+- Fix a task comment holding a long unbroken path or id stretching its card past the timeline
+- Fix replacing a project's uploaded icon with another sometimes leaving the old image showing
+
+### v0.1.36
+6 October, 2026
+- Bundle Vicoa CLI daemon [v1.9.9](/docs/changelog/vicoa-cli#v199)
+- Drag automations into the order you want, or move them with space and the arrow keys; the order is saved, it is yours alone, and under All automations a row moves within its project's group
+- Pick an automation's project with the same picker as a new session, and keep using it while the target machine is offline
+- Pick a saved agent straight from an automation's Agent dropdown, as on the new session page; the model, effort and permission chips step aside since each run uses the agent's own config, and Run now uses its instructions
+- Type `#` in the new session prompt to reference a session, task or automation, as you already can in the chat
+- A project's settings have a Sharing tab beside General, with the same People and Link panels as the Share dialog
+- A project shared with you has Tasks and Automations side by side in its sidebar menu; your own project's menu now sticks to settings, sharing and archiving
+- A project shared with you only takes your sessions once you add it to your sidebar, and the folder picker leaves out shared projects you have not added
+- Fix worktree setup failing with `pnpm: command not found` after the app was opened from Finder, the Dock or an update on a busy machine; the daemon now gets your full shell environment, and Restart daemon recovers without quitting the app
+- Fix restarting the app ending a running session whose prompt mentioned the daemon, which then showed as finished
+
+### v0.1.35
+5 October, 2026
+- Bundle Vicoa CLI daemon [v1.9.8](/docs/changelog/vicoa-cli#v198)
+- Share a project's automations along with its tasks and sessions: the Share dialog has an Automations switch on the People tab and on links. People you share with see them read-only, since editing, running and pausing stay with whoever created the automation
+- The Automations page opens on All automations, grouped by project, with a project picker to narrow it; automations shared with you show their author's avatar and open read-only
+- A session started by an automation shows a chip naming it, and a project's sidebar menu links to its automations
+- A share link's page can filter its sessions by status (Active, In Progress, In Review, Done, Archived), and its sidebar can be resized
+
+### v0.1.34
+3 October, 2026
+- Bundle Vicoa CLI daemon [v1.9.8](/docs/changelog/vicoa-cli#v198)
+- A session shared with you opens in the normal session page and updates live: an editor prompts from the same composer, a viewer reads along
+- Sessions more than one person wrote in show who is in them, with faces beside the title, on the sidebar row and over each person's prompts; other people's sessions in a project you own sit under a collapsed Team row at the end of the project
+- Move a project into a team, or back to your own space, from its settings; the team page lists the team's projects, agents and labels, and anyone on the team can run its agents
+- Teams get a free Viewer role that reads and comments without taking a seat, and seats are bought and changed on their own page, linked from Billing and the team page
+- Play a video from the Files tab instead of getting "No preview available"; it streams and seeks without downloading the whole file first
+- A task's page lists its sub-tasks with done/total progress and an input to add more, and a sub-task links back to its parent
+- The session sidebar starts grouped by project on a fresh install; a grouping you already picked is kept
+- Fix the desktop app and the `vicoa` CLI fighting over the sign-in: a desktop sign-in after `vicoa --auth` now takes effect, and `vicoa --auth` no longer signs the app out
+- Fix the transcript bouncing at the bottom as you scroll
+
+### v0.1.33
+29 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.7](/docs/changelog/vicoa-cli#v197)
+- Share a project or a session with specific people, not only by link: the Share dialog has a new People tab where you invite by email or pick a team, give a role (Viewer, Commenter, Editor or Admin) and choose whether they see the tasks, the sessions or both
+- Settings → Teams lets you create a team and invite people by email or with an invite link; an invitation shows up in the invitee's account menu with Join and Decline
+- Anything shared with you appears under Shared with me in the sidebar, and a shared session opens read-only and refreshes on its own
+- With a project selected, the Tasks page shows who it is shared with next to Share
+- A "+" on the sidebar's Workspaces header starts a new session, and an empty sidebar now tells you how to get going
+- Join Discord straight from the account menu
+- Auto mode is offered for every Claude model, including older ones like Opus 4.6
+- Fix the transcript flickering between two scroll positions when a long message or an agent's question sat near the edge of the view
+- Fix deleting a clean worktree failing with a submodule error in a repo whose submodules were never checked out there
+
+### v0.1.32
+26 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.6](/docs/changelog/vicoa-cli#v196)
+- Type `#` in the composer to point the agent at another Vicoa thing — a live session, a task or an automation — and it goes out with your message as context; referencing a task also files the session under that task, and deleting the token drops the attachment
+- Hide the sidebar rows you don't use: New Session, Tasks, Automations, Agents, Skills and Search each get a switch under Settings → Appearance → Sidebar, and a hidden row's page stays reachable by URL
+- Cmd/Ctrl+E toggles focus mode in both directions, replacing a shortcut that typed a stray backtick into the file you were editing instead of firing
+- Delete an archived session straight from its sidebar row — the trash icon takes the slot Archive vacates once a session is archived
+- Claude Opus 5.5 joins the model picker
+
+### v0.1.31
+24 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.5](/docs/changelog/vicoa-cli#v195)
+- Linux gets the app's own title bar, so the window no longer wears two of them plus Chromium's menu bar — the logo, the application-menu button and the min/max/close cluster are drawn by the app, Alt still reveals the native menu, and Settings -> Appearance -> Window -> Title bar -> System hands the frame back to your desktop if you would rather it drew its own
+- Edit a markdown table in the grid instead of in its pipes — type straight into a cell, Tab and the arrows walk between cells and rows, your hand-aligned spacing survives, and Escape drops back into the markdown on the same character for the things a grid cannot express
+- The markdown editor follows links on Cmd/Ctrl+click, with the link underlining itself while the key is held; pasting from a web page now keeps its links, headings and tables as markdown rather than flattening them to plain text
+- Front matter at the top of a markdown file reads as a quiet metadata block instead of a stray divider, a click on a table lands in the cell you clicked, and the editor uses the panel's full width rather than stopping mid-pane
+- Sessions live at their own address now — `/dashboard/sessions/<id>`, with `/dashboard/sessions/new` for a new one — leaving `/dashboard/agents` to the saved agent presets it was named for; old links, bookmarks and notifications keep working
+- "Open" on a session card in a task's timeline opens that session, rather than dropping you on the dashboard's "start a session" home
+- A share link's "Settings" edits the link you already sent — audience, expiry, what it shows, what it covers — with "New link" still there for when a fresh URL is the point
+- Onboarding shows every built-in agent on the intro strip, and the agent-scan list scrolls with the app's own scrollbar
+- Fix a session that is still running being marked finished after seven idle days, which could end a session part-way through a long rate-limit wait
+- Fix OpenCode reading as not installed when it was installed with its own installer
+
+### v0.1.30
+22 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.4](/docs/changelog/vicoa-cli#v194)
+- Diffs now box the words that changed, the way an editor does — in the Changes tab and in the editable side-by-side view, layered over syntax highlighting rather than replacing it, with a re-wrapped paragraph pairing up properly instead of reading as a full rewrite
+- Fix a large file with edits scattered through it rendering as one solid red block over one solid green block, with every untouched line in between counted as changed
+- Fix a share link that opted into showing your name drawing an initials disc instead of your picture, and the same for assignees, comment authors and reactors on a shared board
+
+### v0.1.29
+21 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.3](/docs/changelog/vicoa-cli#v193)
+- Project settings live in one place — Settings → your project has General (display, linked folders per machine, archive and delete), Git & Worktree (setup hooks, with a machine picker when several are linked) and Tasks (the task key prefix, settable before the first task); the Tasks page gear now takes you there
+- Labels get their own Settings → Tasks tab — one vocabulary across all your projects
+- Settings lists every project, including ones without a session, with archived projects under a collapsed group so Unarchive and Delete stay reachable
+- Delete worktree no longer makes you wait — the dialog closes on Confirm, the worktree's sessions are archived together and their terminals closed, and a failure reopens the dialog with the error and a Retry button
+- Collapsed tool runs and sub-agents show one chip per edited file — name only, full path on hover, wrapping whole rather than clipping — and clicking a chip opens the file in the Files panel; up to 8 before "+N more"
+- OpenCode edits and commands are carded like Claude Code's, with the path and diff on one card
+- A session moved with `vicoa session update --worktree` jumps to its new sidebar group immediately, no reload needed
+- Fix search showing "Search failed" for any query that matched a task under "No project"
+
+### v0.1.28
+20 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.2](/docs/changelog/vicoa-cli#v192)
+- Share a session or a project with a read-only link from the session header, the sidebar ⋯ menu or the Tasks header — public or signed-in only, with expiry and a choice of tasks and/or sessions
+- New session picks a project, not a path — your projects on the chosen machine come first, and a subfolder carries into a new worktree
+- Worktree setup shows as a badge in the session header with progress, log and Retry
+- Fork carries the whole conversation, prose only — tool output is left out so the new agent re-reads what it needs
+- Sidebar project order syncs across devices
+- "Inbox" is now "No project"; deleting a project moves its tasks and sessions there instead of deleting them
+- Hover anywhere on a worktree row to open its pull-request panel, now beside the sidebar
+- The "working…" indicator no longer shifts the transcript at the start and end of a turn
+- Fix file links with a space or non-ASCII character in the path failing to open, copy or reveal
+
+### v0.1.27
+16 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.1](/docs/changelog/vicoa-cli#v191)
+- Antigravity joins the agent picker — Google's Antigravity CLI (agy 1.1.15 or newer) with its live model list and three permission modes (read only, accept edits, bypass), switchable from the gear mid-session
+- See your Codex and GitHub Copilot usage in the composer, the same meter Claude sessions already had; catalog-added agents now get a real model and permission-mode picker on the new-session page, probed once per machine
+- Branch icons in the sidebar are coloured by pull-request state — green open, purple merged, red closed, grey draft or none — and hovering one shows the title, check status and buttons to open or copy the PR link
+- Name a new worktree from the picker — the name becomes the branch and the folder, is checked as you type, and a taken name suggests the first free suffix instead of silently picking another
+- Open a file with the OS default app or reveal it in Finder / File Explorer / File Manager straight from the "No preview available" card and the Open in ▾ menu — and spreadsheets, Word and PowerPoint documents, PDFs, archives, audio, video and fonts now get their own icons in the file tree, tabs and search palette
+- Start a session from a task's detail page — the same flow as the board's context menu, including the sub-task picker
+- The Changes tab's Refresh button now refreshes the history pane too, and Files and Changes refresh on their own when the session's agent finishes a turn
+- A machine that goes offline with editor tabs open no longer keeps firing failed file checks — the check backs off until the machine is back
+- Fix a session failing to start with "Headless Claude encountered a fatal error" when the server is slow, and a failed start now says why instead of opening an empty session
+
+### v0.1.26
+13 September, 2026
+- Bundle Vicoa CLI daemon [v1.9.0](/docs/changelog/vicoa-cli#v190)
+- Add an agent in one click — Settings → Providers now lists a catalog of 33 ACP agents (Cline, Factory Droid, Qwen Code, Amp, goose, Junie, Kilo and more) with their logos; Add puts one on the machine you pick, and Check launches it and tells you whether it works, which models it offers, or exactly why it failed
+- Agents added by hand in `~/.vicoa/config.json` appear in the agent picker too, with a readable label and icon
+- ACP agents (Cursor, Gemini CLI, Copilot, Kimi and the catalog ones) now show tool calls as they start, the agent's plan as a checklist, live token usage, and the agent's own slash commands in the composer
+- Select chat text reliably — drags no longer die about one time in fifteen on a Retina trackpad, a drag that leaves a table stays on the row you are level with, a selection no longer spreads backwards while the transcript updates, and tool rows, thinking cards and links are selectable too
+- Ctrl+Tab and the other Ctrl shortcuts no longer also type into the terminal — switching tabs used to send a Tab to the shell (and on Linux, Ctrl+W closed the tab and deleted a word)
+- Worktree groups in the sidebar follow the folder, so checking out a new branch inside a worktree no longer splits it into two groups; a worktree removed outside the app is shown struck through, and Delete worktree cleans it up instead of failing with `not_a_repo`
+- Fix a just-created session appearing as a second copy of its project in the sidebar until the next reload
+- Fix Settings → Providers making the page scroll sideways when one agent's description was long
+
+### v0.1.25
+12 September, 2026
+- Bundle Vicoa CLI daemon [v1.8.1](/docs/changelog/vicoa-cli#v181)
+- Steer a queued message into the running turn — each row in the queued-messages bar gets a Steer button that delivers it at the agent's next safe boundary instead of after the turn (Claude Code, Codex, Pi and Oh My Pi)
+- Paste a screenshot straight into the composer — ⌘/Ctrl+V attaches a clipboard image in the session composer and the new-session prompt, with the same preview chip and upload as the file picker
+- Click a file an agent mentions to open it in the Files panel at the referenced line, instead of the OS browser
+- See what a sub-agent did — a collapsed sub-agent group names the work and lists each edited file with its diff, the assignment rides the Agent row, and backgrounded shell commands no longer masquerade as sub-agents
+- Updates download in the background — the sidebar callout appears once the update is ready, with a single Install & Restart
+- Open the window about 3 seconds sooner on launch and quit instantly, even with several terminal tabs open
+- Fix bare URLs in chat swallowing trailing punctuation and bold closers
+
+### v0.1.24
+10 September, 2026
+- Bundle Vicoa CLI daemon [v1.8.0](/docs/changelog/vicoa-cli#v180)
+- Save agent presets in Settings → Agents — a provider, model, config and system prompt under one name — then pick one from "My agents" in the new-session Agent chip; sessions started from a preset carry its name and avatar, and automations can reference one
+- Give tasks a short `KEY-42` identifier, a comment thread with emoji reactions, and an activity timeline showing every change and the sessions that made it
+- Say why a new session can't be sent yet — the reason now sits right above the composer instead of off-screen at the top of the pane, and you can type your message while the machine is still connecting
+- Fix worktree setup hanging with a half-typed command in the terminal tab — long setup chains now run
+- Fix Stop leaving Claude's background sub-agents running, and a session that showed as active with nothing in it afterwards
+
+### v0.1.23
+8 September, 2026
+- Bundle Vicoa CLI daemon [v1.7.19](/docs/changelog/vicoa-cli#v1719)
+- Open the current file or the project root in Finder, Explorer, VS Code, Cursor, Zed, a terminal and more — from the Files panel or the session header, listing only the apps actually installed on that machine
+- Copy any chat message, and fork a session from an agent turn to carry the transcript so far into a new session on the same machine, directory and agent
+- Find in conversation now searches text hidden inside collapsed rows — tool calls, sub-agent groups and thinking cards — and expands the row when you step onto a match
+- Search the new-session task picker by task title, description or project
+- Set a profile picture — upload your own or keep the one from your sign-in provider — shown everywhere you appear
+- Fix a Codex session dying for good after a large tool result
+
+### v0.1.22
+6 September, 2026
+- Bundle Vicoa CLI daemon [v1.7.18](/docs/changelog/vicoa-cli#v1718)
+- Start sessions with Pi and Oh My Pi — both in the new-session picker, with their models, icons, and install checks
+- Open links in the terminal with ⌘/Ctrl+click
+- Find Vicoa's source on GitHub from inside the app and the site
+- Fix long worktree setup commands being truncated when typed into a fresh terminal, so setup chains actually run
+- Fix the files and git panel ignoring the light theme, and its separator sitting on top of dialogs
+- Show project icons in the Settings navigation and add a settings gear to the sidebar
+- Fix a session's awaiting-input dot staying lit after you'd viewed and left it
+
+### v0.1.21
+3 September, 2026
+- Bundle Vicoa CLI daemon [v1.7.17](/docs/changelog/vicoa-cli#v1717)
+- Add a real light theme with a systematic, token-driven design and an Appearance tab in Settings to switch themes (dark is unchanged)
+- Add a declarative plugin system — install and manage Tier 1 plugins (custom themes, sidebar links, composer actions) from Settings, with a first-load trust gate
+- Unify project identity across the sidebar, Tasks, and Settings — auto-created projects with image, emoji, or generated icons (seeded from your git remote), cross-device archive, and stale-project auto-archiving
+- Show model reasoning as a collapsible Thinking card, and render agent tool calls as tidy collapsible cards
+- Add Opus 5 to the new-session picker and default supported Claude models to auto mode
+- Restore a session's model, effort, and permission mode when you resume it, so an auto-mode session no longer comes back as default
+
+### v0.1.20
+2 September, 2026
+- Bundle Vicoa CLI daemon [v1.7.16](/docs/changelog/vicoa-cli#v1716)
+- Run per-worktree setup and teardown scripts when you open or remove a worktree session, with the setup output shown live in the session terminal
+
+### v0.1.19
+31 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.15](/docs/changelog/vicoa-cli#v1715)
+- Group sessions under their project in the sidebar and keep worktree grouping stable, so sessions no longer jump to the wrong repo
+- Live-update the onboarding checklist as you complete steps, without a page refresh
+- Keep your place when a new session opens after you've navigated away, instead of stealing focus
+
+### v0.1.18
+24 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.12](/docs/changelog/vicoa-cli#v1712)
+- Show why a session failed to start or went silent directly in the composer, instead of a generic "not accepting input"
+- Esc unfocuses the chat composer instead of interrupting a running turn
+- Fix the message bounce when sending a message mid-turn
+- Fix task-list markdown rendering in chat so long items no longer shatter into columns
+- Auto-focus the terminal on open, tab-switch, and cycle
+
+### v0.1.17
+20 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.11](/docs/changelog/vicoa-cli#v1711)
+- Add a Skills tab to view, install (from a git URL), and uninstall per-machine agent skills, with per-agent tabs, search, and a skill detail dialog
+- Auto-continue rate-limited sessions once their limit window resets
+
+### v0.1.16
+18 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.10](/docs/changelog/vicoa-cli#v1710)
+- Add a file finder (⌘P) and more session keyboard shortcuts
+- Add a HEAD-vs-staged baseline toggle to the file diff view
+- Pair changed diff lines and highlight intra-line word changes
+- Move Refresh into the Changes toolbar and collapse extra actions into a ⋯ menu
+- Persist Files/Changes panel view toggles as preferences
+- Show the absolute reset time in the usage indicator
+- Show repo-local skills in new-session and mention menus
+- Kill terminals when a session is closed
+- Fix the side-by-side diff scrollbar reverting to the browser default and match CodeMirror scrollbars to the site style
+- Use ⌥` for the peek-chat toggle
+
+### v0.1.15
+13 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.9](/docs/changelog/vicoa-cli#v179)
+- Add Providers and Machines settings tabs, an onboarding setup checklist, and an "Install Vicoa CLI on launch" step
+- Stage, unstage, and commit individual files in the Changes panel
+- Jump to the first change and step through changes with next/prev buttons in the diff viewer
+- Add a split terminal dock to the Files/Changes panel
+- Add fuzzy file search in the file tree and improve file content search
+- Remember file scroll position per tab in the Files panel
+- Refine slash commands and skills and `@`-file mentions in automations
+- Fix the terminal button being blocked in expanded view
+
+### v0.1.14
+10 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.8](/docs/changelog/vicoa-cli#v178)
+- Add an "Install vicoa command" action to set up the CLI from the desktop app
+- Open a terminal tab with ⌘T even when the panel is closed
+- Add in-file find and fuzzy file search to the Files panel
+- Add minutely and daily-window scheduling to Automations
+- Silence phone push while you're actively using the desktop app
+- Polish the edit-file tool-use display for multi-file edits
+- Fix side-by-side diff scrolling in the Files panel
+
+### v0.1.13
+9 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.7](/docs/changelog/vicoa-cli#v177)
+- Edit git diffs and files in the Files panel, with file tabs
+- Add find-in-conversation search to the agent chat
+- Add a Files-panel focus mode with a chat peek
+- Add on-demand daemon download and terminal installers
+- Link tasks to their sessions in Tasks and search
+- Show Ctrl+Tab panel-tab shortcuts in settings
+- Refresh the Vicoa logo
+
+### v0.1.12
+6 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.6](/docs/changelog/vicoa-cli#v176)
+- Add ⌘K workspace search with a command palette
+- Improve terminals: focus on open and tab click, close the active tab with ⌘W, and stop the lease reaper from killing live remote terminals
+- Add drag-and-drop to the new-session composer and fix a stuck overlay when leaving the file explorer
+- Add skeleton loaders and caching to the Tasks and Automations pages
+- Fix a chat-input submit issue and the session rename dialog
+- Fix Windows desktop panel and terminal issues
+
+### v0.1.11
+2 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.4](/docs/changelog/vicoa-cli#v174)
+- Enable infinite scroll in the sidebar session list
+- Improve Automations: keep Run now on-page and link its run to the spawned session; gate worktrees on git repos and order machines online-first
+- Make page headers draggable across the dashboard and fix window-controls spacing
+
+### v0.1.10
+1 August, 2026
+- Bundle Vicoa CLI daemon [v1.7.4](/docs/changelog/vicoa-cli#v174)
+- Support Automations: schedule recurring agent runs with a two-pane editor, frequency controls, a status toggle, and run history
+- Retain the machine, directory, worktree, and task selections across visits to the new-session page
+- Make keyboard shortcuts OS-aware (⌘ on macOS, Ctrl on Windows) and add ⌘/Ctrl+L to focus the new-session input
+- Improve sidebar session loading
+- Fix the Windows renderer crash, Windows initial version is ready for testing
+
+### v0.1.9
+31 July, 2026
+- Bundle Vicoa CLI daemon [v1.7.3](/docs/changelog/vicoa-cli#v173)
+- Add icons and tighter, dimmed styling to the agent tool-use display
+- Add a retrieve button to re-fetch a stalled reply
+- Allow deleting any git worktree, not just Vicoa-managed ones
+
+### v0.1.8
+29 July, 2026
+
+New Features
+- Bundle Vicoa CLI daemon [v1.7.2](/docs/changelog/vicoa-cli#v172)
+- Edit files in place in the Files panel, not just preview them
+- Support add folder and file drag-and-drop to the chat
+
+Improvement
+- Make Ask User Question text selectable; improve markdown-preview and textarea scrollbars to the sidebar style
+- Cut typing lag in remote terminals and reap orphaned terminals left behind after a disconnect
+
+Bug Fix
+- Fix the Windows blank/white screen and clearer first-launch error reporting
+
+### v0.1.7
+27 July, 2026
+- Bundle Vicoa CLI daemon [v1.7.1](/docs/changelog/vicoa-cli#v171)
+- Add a custom Windows title bar with frameless chrome
+- Fix the Windows blank main page and polish the onboarding and paywall screens
+- Keep intro and welcome content centered at tall window heights
+- Add task ordering to the Display menu
+
+### v0.1.6
+26 July, 2026
+- Bundle Vicoa CLI daemon [v1.7.1](/docs/changelog/vicoa-cli#v171)
+- Open terminals on remote machines over the relay, and enable web terminals
+- Restore open terminals and file tabs after a restart; close them when a session is archived or deleted
+- Enhance Tasks: parent/sub-task linking, a sub-task picker when starting a session, local view tabs, Display options, and drag-and-drop polish
+- Check for updates on focus, resume, and reload instead of only every 6 hours
+
+### v0.1.5
+24 July, 2026
+- Bundle Vicoa CLI daemon [v1.6.12](/docs/changelog/vicoa-cli#v1612)
+- Add a Tasks tab: board and list views, a create/edit dialog, drag-and-drop reordering, labels, sub-tasks, and a settings dialog with date and emoji pickers and folder links
+- Start a session from a task with a new-session Task chip and prompt seeding
+- Read `@`-mentions from the live daemon file index
+
+### v0.1.4
+23 July, 2026
+- Bundle Vicoa CLI daemon [v1.6.11](/docs/changelog/vicoa-cli#v1611)
+- Group sidebar sessions by worktree (selection): git-driven grouping, delete flow, new-session preselect
+- Turn the send button into Stop while a turn runs; show the Stop press immediately in the transcript
+- Clear the stopped dot on resume in both sidebars
+- Hide the worktree chip when the folder isn't a git repo
+- Fix several desktop issues: machine-difference detection, intro image sizing
+
+### v0.1.3
+21 July, 2026
+- Bundle Vicoa CLI daemon [v1.6.8](/docs/changelog/vicoa-cli#v168)
+- Support resuming a stopped session from the actions menu
+- Show when a session's agent is no longer running
+- Support image attachments: attach to the first message, image-only bubbles, upload and render in chat
+- Expand submodules into their working-tree changes in the Changes panel
+- Add an "Unread" action to mark a reviewed session awaiting-input again
+
+### v0.1.2
+19 July, 2026
+- Bundle Vicoa CLI daemon [v1.6.7](/docs/changelog/vicoa-cli#v167)
+- Add commit history to the Changes tab: commit graph, file list, diff view, resizable pane
+- Show context-window and rate-limit usage
+- Stage queued messages in a bar above the chat input, with a cancel action
+- Group sub-agent activity under a collapsible header
+- Force process exit after an update install so the app actually relaunches
+- Move the update notice into a sidebar callout
+
+### v0.1.1
+18 July, 2026
+- Desktop sign-in
+- New-session page with config chips (agent, model, effort, permission mode), project picker, git worktree support, and draft persistence
+- Files/Changes right panel: directory tree drawer, markdown preview, syntax-colored file icons, and a git Changes tab
+- Multi-terminal tabs with keep-alive sessions and global shortcuts (⌘T, ⌘J, ⌘⇧F, ⌘L, ⌘,)
+- Native notifications: session-status banners, dock badge, one-time System Settings enablement nudge
+- Settings shell with rebindable shortcuts and notification mode
+- Sidebar: group-by/filter menus, per-project new session, right-click session actions
+- Collapsible tool-use rendering and a redesigned Ask User Question panel
+
+### v0.1.0
+18 July, 2026
+- Initial release: tray icon, macOS titlebar, and auto-update pipeline (arm64 + Intel x64)
+
+
+## Related
+
+- [Mobile app changelog](/docs/changelog/mobile-app) — releases for iOS and Android
+- [Vicoa CLI changelog](/docs/changelog/vicoa-cli) — releases for the CLI and daemon
+- [Updates](/updates) — feature announcements with screenshots
+- [Version Compatibility](/docs/version-compatibility) — which CLI and app versions pair together

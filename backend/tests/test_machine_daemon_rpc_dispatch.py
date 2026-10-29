@@ -1,0 +1,788 @@
+"""`_handle_rpc_request` routes new methods to `vicoa.rpc.file_ops`.
+
+Covers `plans/todos/vicoa-app-files-tab.md` §Phase B Wire-up. The dispatcher
+itself stays sync to match `spawn-session`; the file-op handlers are fast
+enough to run inline.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from vicoa.machine_daemon import MachineDaemon
+
+
+@pytest.fixture
+def daemon() -> MachineDaemon:
+    return MachineDaemon(api_key="test-key", base_url="http://localhost:0")
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(tmp_path)],
+        check=True,
+    )
+    return tmp_path
+
+
+def test_list_files_dispatched_to_handler(daemon: MachineDaemon, git_repo: Path):
+    (git_repo / "readme.md").write_text("hi")
+    frame = {
+        "method": "list-files",
+        "params": {"cwd": str(git_repo), "path": ""},
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result == {"entries": [{"name": "readme.md", "type": "file", "size": 2}]}
+
+
+def test_read_file_dispatched_to_handler(daemon: MachineDaemon, git_repo: Path):
+    (git_repo / "hello.txt").write_text("hi")
+    frame = {
+        "method": "read-file",
+        "params": {"cwd": str(git_repo), "path": "hello.txt"},
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result["content"] == "hi"
+    assert result["size"] == 2
+    assert result["is_binary"] is False
+
+
+def test_read_file_range_dispatched_and_advertised(
+    daemon: MachineDaemon, git_repo: Path
+):
+    (git_repo / "clip.mp4").write_bytes(b"0123456789")
+    frame = {
+        "method": "read-file-range",
+        "params": {"cwd": str(git_repo), "path": "clip.mp4", "offset": 2, "length": 3},
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result["content"] == "MjM0"  # base64 of b"234"
+    assert result["size"] == 10
+    assert "read-file-range" in daemon._supported_rpc_methods()
+
+
+def test_git_status_dispatched_to_handler(daemon: MachineDaemon, git_repo: Path):
+    # Empty git repo dispatch sanity check — handler returns the branch field
+    # without error.
+    frame = {"method": "git-status", "params": {"cwd": str(git_repo)}}
+    result = daemon._handle_rpc_request(frame)
+    assert "branch" in result
+    assert result["staged"] == []
+    assert result["unstaged"] == []
+    assert result["untracked"] == []
+
+
+def test_git_diff_dispatched_to_handler(daemon: MachineDaemon, git_repo: Path):
+    # Commit a file, then diff a worktree modification through the RPC path.
+    subprocess.run(
+        ["git", "-C", str(git_repo), "config", "user.email", "t@e.com"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(git_repo), "config", "user.name", "T"], check=True)
+    (git_repo / "x.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(git_repo), "add", "x.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "-q", "-m", "init"], check=True
+    )
+    (git_repo / "x.txt").write_text("a\nb\n")
+    frame = {
+        "method": "git-diff",
+        "params": {
+            "cwd": str(git_repo),
+            "path": "x.txt",
+            "staged": False,
+            "ignore_whitespace": False,
+        },
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result["path"] == "x.txt"
+    assert result["is_binary"] is False
+    assert len(result["hunks"]) >= 1
+
+
+def test_unknown_method_returns_error_dict(daemon: MachineDaemon):
+    result = daemon._handle_rpc_request({"method": "no-such-method"})
+    assert "error" in result
+    assert "no-such-method" in result["error"]
+
+
+@pytest.fixture
+def committed_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "src" / "app"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    for k, v in (
+        ("user.email", "t@e.com"),
+        ("user.name", "T"),
+        ("commit.gpgsign", "false"),
+    ):
+        subprocess.run(["git", "-C", str(repo), "config", k, v], check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True)
+    return repo
+
+
+@pytest.fixture
+def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    return h
+
+
+def test_git_worktree_list_dispatched_to_handler(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    frame = {"method": "git-worktree-list", "params": {"cwd": str(committed_repo)}}
+    result = daemon._handle_rpc_request(frame)
+    assert "worktrees" in result
+
+
+def test_git_worktree_remove_dispatched_to_handler(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    from vicoa.rpc.worktree_ops import create_worktree
+
+    created = create_worktree(str(committed_repo))
+    frame = {
+        "method": "git-worktree-remove",
+        "params": {
+            "cwd": str(committed_repo),
+            "worktree_path": created["path"],
+            "force": False,
+        },
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result == {"ok": True}
+
+
+def test_git_worktree_remove_runs_teardown_first(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+
+    from vicoa.rpc.worktree_ops import create_worktree
+    from vicoa.rpc.worktree_trust import grant_repo_trust
+
+    # Teardown only fires for a trusted repo (the source repo, keyed by path).
+    grant_repo_trust(str(committed_repo))
+    created = create_worktree(str(committed_repo))
+    # Marker lands in the source repo (survives the removal) so we can prove the
+    # teardown ran against the worktree before `git worktree remove` deleted it.
+    marker = committed_repo / "teardown_ran"
+    (Path(created["path"]) / "vicoa.json").write_text(
+        json.dumps({"worktree": {"teardown": [f"touch {marker}"]}})
+    )
+    frame = {
+        "method": "git-worktree-remove",
+        "params": {
+            "cwd": str(committed_repo),
+            "worktree_path": created["path"],
+            "force": True,
+        },
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result == {"ok": True}
+    assert marker.exists()
+    assert not Path(created["path"]).exists()
+
+
+def test_git_worktree_remove_teardown_failure_does_not_block(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+
+    from vicoa.rpc.worktree_ops import create_worktree
+    from vicoa.rpc.worktree_trust import grant_repo_trust
+
+    grant_repo_trust(str(committed_repo))
+    created = create_worktree(str(committed_repo))
+    (Path(created["path"]) / "vicoa.json").write_text(
+        json.dumps({"worktree": {"teardown": "exit 7"}})
+    )
+    frame = {
+        "method": "git-worktree-remove",
+        "params": {
+            "cwd": str(committed_repo),
+            "worktree_path": created["path"],
+            "force": True,
+        },
+    }
+    # A failing teardown is non-fatal — the removal still succeeds.
+    result = daemon._handle_rpc_request(frame)
+    assert result == {"ok": True}
+    assert not Path(created["path"]).exists()
+
+
+def test_git_worktree_remove_skips_teardown_when_untrusted(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+
+    from vicoa.rpc.worktree_ops import create_worktree
+
+    # No trust grant → the untrusted repo's teardown must NOT run.
+    created = create_worktree(str(committed_repo))
+    marker = committed_repo / "teardown_ran"
+    (Path(created["path"]) / "vicoa.json").write_text(
+        json.dumps({"worktree": {"teardown": [f"touch {marker}"]}})
+    )
+    result = daemon._handle_rpc_request(
+        {
+            "method": "git-worktree-remove",
+            "params": {
+                "cwd": str(committed_repo),
+                "worktree_path": created["path"],
+                "force": True,
+            },
+        }
+    )
+    assert result == {"ok": True}
+    assert not marker.exists()  # teardown skipped
+    assert not Path(created["path"]).exists()  # removal still happened
+
+
+def test_worktree_trust_grant_dispatched(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    from vicoa.rpc.worktree_trust import is_repo_trusted
+
+    assert is_repo_trusted(str(committed_repo)) is False
+    result = daemon._handle_rpc_request(
+        {"method": "worktree-trust-grant", "params": {"directory": str(committed_repo)}}
+    )
+    assert result == {"ok": True}
+    assert is_repo_trusted(str(committed_repo)) is True
+
+
+def test_worktree_trust_grant_requires_directory(daemon: MachineDaemon):
+    result = daemon._handle_rpc_request(
+        {"method": "worktree-trust-grant", "params": {}}
+    )
+    assert "error" in result
+
+
+def test_worktree_run_setup_untrusted_is_refused(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+
+    from vicoa.rpc.worktree_ops import create_worktree
+
+    created = create_worktree(str(committed_repo))
+    (committed_repo / "vicoa.json").write_text(
+        json.dumps({"worktree": {"setup": ["touch should_not_run"]}})
+    )
+    result = daemon._handle_rpc_request(
+        {
+            "method": "worktree-run-setup",
+            "params": {
+                "worktree_path": created["path"],
+                "directory": str(committed_repo),
+            },
+        }
+    )
+    assert result == {"error": "untrusted"}
+
+
+def test_worktree_run_setup_trusted_runs_in_background(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+    import time
+
+    from vicoa.rpc.worktree_ops import create_worktree
+    from vicoa.rpc.worktree_trust import grant_repo_trust
+
+    grant_repo_trust(str(committed_repo))
+    created = create_worktree(str(committed_repo))
+    # Marker outside the worktree so it survives; config on the source repo.
+    marker = committed_repo / "bg_setup_ran"
+    (committed_repo / "vicoa.json").write_text(
+        json.dumps({"worktree": {"setup": [f"touch {marker}"]}})
+    )
+    result = daemon._handle_rpc_request(
+        {
+            "method": "worktree-run-setup",
+            "params": {
+                "worktree_path": created["path"],
+                "directory": str(committed_repo),
+            },
+        }
+    )
+    assert result.get("ok") is True
+    # Background thread — poll briefly for the effect.
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists()
+
+
+def test_worktree_run_setup_requires_paths(daemon: MachineDaemon):
+    result = daemon._handle_rpc_request(
+        {"method": "worktree-run-setup", "params": {"worktree_path": "/tmp/x"}}
+    )
+    assert "error" in result
+
+
+def test_worktree_setup_status_none_without_a_record(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    result = daemon._handle_rpc_request(
+        {
+            "method": "worktree-setup-status",
+            "params": {"worktree_path": str(committed_repo / "never-set-up")},
+        }
+    )
+    assert result == {"status": "none"}
+    assert "error" in daemon._handle_rpc_request(
+        {"method": "worktree-setup-status", "params": {}}
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="setup engine assumes bash")
+def test_worktree_run_setup_records_progress_and_dedupes(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    import json
+    import time
+
+    from vicoa.rpc.worktree_ops import create_worktree
+    from vicoa.rpc.worktree_trust import grant_repo_trust
+
+    grant_repo_trust(str(committed_repo))
+    created = create_worktree(str(committed_repo))
+    # A gate the test releases, so the run is observably in flight.
+    gate = committed_repo / "gate"
+    (committed_repo / "vicoa.json").write_text(
+        json.dumps(
+            {
+                "worktree": {
+                    "setup": [
+                        "echo step-one",
+                        f"while [ ! -e {gate} ]; do sleep 0.02; done",
+                        "exit 7",
+                        "echo never",
+                    ]
+                }
+            }
+        )
+    )
+    params = {"worktree_path": created["path"], "directory": str(committed_repo)}
+    first = daemon._handle_rpc_request(
+        {"method": "worktree-run-setup", "params": params}
+    )
+    assert first == {"ok": True, "started": True, "total": 4}
+
+    # A second request for the same worktree while it runs must not start a
+    # second install alongside the first.
+    second = daemon._handle_rpc_request(
+        {"method": "worktree-run-setup", "params": params}
+    )
+    assert second == {"ok": True, "started": False, "already_running": True}
+
+    def status() -> dict:
+        return daemon._handle_rpc_request(
+            {
+                "method": "worktree-setup-status",
+                "params": {"worktree_path": created["path"]},
+            }
+        )
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        s = status()
+        if s.get("status") == "running" and s["commands"][1]["status"] == "running":
+            break
+        time.sleep(0.02)
+    assert s["status"] == "running"
+    assert s["total"] == 4
+    assert s["commands"][0]["status"] == "ok"
+    assert "step-one" in s["output_tail"]
+
+    gate.touch()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        s = status()
+        if s.get("status") != "running":
+            break
+        time.sleep(0.02)
+    assert s["status"] == "failed"
+    # Stops at the first failure; the fourth command never ran.
+    assert [c["status"] for c in s["commands"]] == ["ok", "ok", "failed", "pending"]
+    assert s["commands"][2]["exit_code"] == 7
+    assert s["finished_at"] is not None
+
+    # Finished → the slot is free again for a rerun.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        again = daemon._handle_rpc_request(
+            {"method": "worktree-run-setup", "params": params}
+        )
+        if again.get("started"):
+            break
+        time.sleep(0.02)
+    assert again.get("started") is True
+
+    # Removing the worktree forgets its record.
+    deadline = time.monotonic() + 5
+    while status().get("status") == "running" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    removed = daemon._handle_rpc_request(
+        {
+            "method": "git-worktree-remove",
+            "params": {
+                "cwd": str(committed_repo),
+                "worktree_path": created["path"],
+                "force": True,
+            },
+        }
+    )
+    assert "error" not in removed
+    assert status() == {"status": "none"}
+
+
+def test_git_worktree_check_name_dispatched_to_handler(
+    daemon: MachineDaemon, committed_repo: Path, home: Path
+):
+    frame = {
+        "method": "git-worktree-check-name",
+        "params": {"cwd": str(committed_repo), "name": "feat-login"},
+    }
+    assert daemon._handle_rpc_request(frame) == {"available": True}
+
+
+def test_worktree_methods_are_advertised(daemon: MachineDaemon):
+    # The server routes a method to this daemon only if it advertises it on
+    # connect, so dispatch support is useless unless the method is announced.
+    advertised = daemon._supported_rpc_methods()
+    assert "git-worktree-list" in advertised
+    assert "git-worktree-check-name" in advertised
+    assert "git-worktree-remove" in advertised
+    assert "worktree-trust-grant" in advertised
+    assert "worktree-run-setup" in advertised
+    assert "worktree-setup-status" in advertised
+    # The name field is feature-detected separately from `worktree`: an old
+    # daemon drops `worktree.name` silently and spawns a random slug.
+    assert "worktree-name" in daemon._capabilities()
+
+
+def _head(repo: Path) -> str:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
+def test_git_log_dispatched_to_handler(daemon: MachineDaemon, committed_repo: Path):
+    frame = {"method": "git-log", "params": {"cwd": str(committed_repo)}}
+    result = daemon._handle_rpc_request(frame)
+    assert "commits" in result
+    assert result["commits"][0]["subject"] == "seed"
+
+
+def test_git_commit_files_dispatched_to_handler(
+    daemon: MachineDaemon, committed_repo: Path
+):
+    frame = {
+        "method": "git-commit-files",
+        "params": {"cwd": str(committed_repo), "commit_id": _head(committed_repo)},
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result["files"] == [
+        {"path": "seed.txt", "status": "A", "additions": 1, "deletions": 0}
+    ]
+
+
+def test_git_commit_diff_dispatched_to_handler(
+    daemon: MachineDaemon, committed_repo: Path
+):
+    frame = {
+        "method": "git-commit-diff",
+        "params": {
+            "cwd": str(committed_repo),
+            "commit_id": _head(committed_repo),
+            "path": "seed.txt",
+        },
+    }
+    result = daemon._handle_rpc_request(frame)
+    assert result["path"] == "seed.txt"
+    assert result["is_binary"] is False
+
+
+def test_commit_history_methods_are_advertised(daemon: MachineDaemon):
+    advertised = daemon._supported_rpc_methods()
+    assert "git-log" in advertised
+    assert "git-commit-files" in advertised
+    assert "git-commit-diff" in advertised
+
+
+# --------------------------------------------------------------------------
+# Remote terminal (pty-* over the cloud relay)
+# --------------------------------------------------------------------------
+def test_pty_methods_are_advertised(daemon: MachineDaemon):
+    advertised = daemon._supported_rpc_methods()
+    for method in ("pty-spawn", "pty-write", "pty-resize", "pty-kill"):
+        assert method in advertised
+
+
+def test_terminal_capability_is_advertised(daemon: MachineDaemon):
+    # The client feature-detects on this to offer the terminal for a remote
+    # machine instead of failing `no_handler`.
+    assert "terminal" in daemon._capabilities()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="PTY sessions are Unix-only")
+def test_pty_spawn_dispatched_to_terminal_service(
+    daemon: MachineDaemon, tmp_path: Path
+):
+    # A remote pty-spawn builds the terminal service lazily and returns a live
+    # pty_id; output would stream via push_frame (no ws client here → dropped).
+    frame = {
+        "method": "pty-spawn",
+        "params": {
+            "cwd": str(tmp_path),
+            "cols": 80,
+            "rows": 24,
+            "command": ["/bin/cat"],
+        },
+    }
+    result = daemon._handle_rpc_request(frame)
+    pty_id = result["pty_id"]
+    try:
+        assert pty_id
+        assert daemon._terminal_service is not None
+        assert pty_id in daemon._terminal_service.live_session_ids()
+        kill = daemon._handle_rpc_request(
+            {"method": "pty-kill", "params": {"pty_id": pty_id}}
+        )
+        assert kill == {}
+    finally:
+        daemon._shutdown_terminals()
+
+
+# --------------------------------------------------------------------------
+# Open in… (list-open-apps / open-path)
+# --------------------------------------------------------------------------
+def test_list_open_apps_dispatched_to_handler(daemon: MachineDaemon):
+    result = daemon._handle_rpc_request({"method": "list-open-apps"})
+    assert result["platform"] == sys.platform
+    assert isinstance(result["apps"], list)
+
+
+def test_open_path_dispatched_to_handler(daemon: MachineDaemon, git_repo: Path):
+    # An unknown app id must be refused by the handler, not shelled out.
+    frame = {
+        "method": "open-path",
+        "params": {"cwd": str(git_repo), "app": "not-a-real-app"},
+    }
+    assert daemon._handle_rpc_request(frame) == {"error": "unknown_app"}
+
+
+def test_open_in_methods_and_capability_are_advertised(daemon: MachineDaemon):
+    advertised = daemon._supported_rpc_methods()
+    assert "list-open-apps" in advertised
+    assert "open-path" in advertised
+    # The client hides the "Open in…" menu unless the daemon says it's routable.
+    assert "open-in" in daemon._capabilities()
+
+
+# --- provider usage + probe cache (agent-integration-followups §2) ---------
+
+
+def test_provider_usage_methods_and_capability_are_advertised(daemon: MachineDaemon):
+    methods = daemon._supported_rpc_methods()
+    assert "fetch-provider-usage" in methods
+    assert "fetch-claude-usage" in methods  # legacy alias stays routable
+    assert "provider-usage" in daemon._capabilities()
+
+
+def test_fetch_provider_usage_dispatched_to_registry(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_usage
+
+    provider_usage.clear_cache()
+    monkeypatch.setitem(
+        provider_usage.PROVIDER_USAGE_FETCHERS,
+        "codex",
+        lambda: {"limits": {"windows": [{"id": "session", "used_pct": 1.0}]}},
+    )
+    result = daemon._handle_rpc_request(
+        {"method": "fetch-provider-usage", "params": {"provider": "codex"}}
+    )
+    assert result == {"limits": {"windows": [{"id": "session", "used_pct": 1.0}]}}
+    assert "error" in daemon._handle_rpc_request(
+        {"method": "fetch-provider-usage", "params": {"provider": "gemini"}}
+    )
+    provider_usage.clear_cache()
+
+
+def test_legacy_fetch_claude_usage_still_dispatched(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_usage
+
+    provider_usage.clear_cache()
+    monkeypatch.setitem(
+        provider_usage.PROVIDER_USAGE_FETCHERS,
+        "claude",
+        lambda: {"error": "no_oauth_token"},
+    )
+    assert daemon._handle_rpc_request(
+        {"method": "fetch-claude-usage", "params": {}}
+    ) == {"error": "no_oauth_token"}
+    provider_usage.clear_cache()
+
+
+def test_probe_ok_puts_models_and_modes_into_the_machine_cache(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_ops
+
+    probe = {
+        "id": "qwen",
+        "ok": True,
+        "stage": "ok",
+        "models": [{"id": "qwen3-coder", "label": "Qwen3 Coder"}],
+        "modes": [{"id": "plan", "label": "Plan"}],
+    }
+    monkeypatch.setattr(provider_ops, "provider_probe", lambda **_kw: dict(probe))
+    daemon.machine_id = "m-1"
+    puts: list[tuple[str, dict]] = []
+
+    def fake_put(path: str, payload: dict):
+        puts.append((path, payload))
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    monkeypatch.setattr(daemon, "_put", fake_put)
+    result = daemon._handle_rpc_request(
+        {"method": "provider-probe", "params": {"provider_id": "qwen"}}
+    )
+    assert result["ok"] is True
+    assert puts == [
+        (
+            "/api/v1/machines/m-1/agent-models/qwen",
+            {"models": probe["models"], "modes": probe["modes"]},
+        )
+    ]
+
+
+def test_probe_failure_or_no_machine_writes_nothing(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_ops
+
+    puts: list[str] = []
+    monkeypatch.setattr(daemon, "_put", lambda path, payload: puts.append(path))
+    monkeypatch.setattr(
+        provider_ops,
+        "provider_probe",
+        lambda **_kw: {"id": "qwen", "ok": False, "stage": "binary", "error": "x"},
+    )
+    daemon.machine_id = "m-1"
+    daemon._handle_rpc_request(
+        {"method": "provider-probe", "params": {"provider_id": "qwen"}}
+    )
+    assert puts == []
+
+    # ok but local-only daemon (no cloud machine row) -> nothing to write to.
+    monkeypatch.setattr(
+        provider_ops,
+        "provider_probe",
+        lambda **_kw: {"id": "qwen", "ok": True, "models": [{"id": "a", "label": "A"}]},
+    )
+    daemon.machine_id = None
+    daemon._handle_rpc_request(
+        {"method": "provider-probe", "params": {"provider_id": "qwen"}}
+    )
+    assert puts == []
+
+
+def test_cache_put_failure_never_fails_the_probe(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_ops
+
+    monkeypatch.setattr(
+        provider_ops,
+        "provider_probe",
+        lambda **_kw: {"id": "qwen", "ok": True, "models": [{"id": "a", "label": "A"}]},
+    )
+    daemon.machine_id = "m-1"
+
+    def boom(path: str, payload: dict):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr(daemon, "_put", boom)
+    result = daemon._handle_rpc_request(
+        {"method": "provider-probe", "params": {"provider_id": "qwen"}}
+    )
+    assert result["ok"] is True
+
+
+def test_provider_add_probes_in_the_background(
+    daemon: MachineDaemon, monkeypatch: pytest.MonkeyPatch
+):
+    from vicoa.rpc import provider_ops
+
+    monkeypatch.setattr(
+        provider_ops, "provider_add", lambda **_kw: {"id": "qwen", "label": "Qwen"}
+    )
+    monkeypatch.setattr(
+        daemon, "scan_agents_rpc", lambda: {"available_agents": {"qwen": True}}
+    )
+    daemon.machine_id = "m-1"
+    started: list[str] = []
+    monkeypatch.setattr(
+        daemon,
+        "_probe_and_cache_agent_models_background",
+        lambda agent_id: started.append(agent_id),
+    )
+    result = daemon._handle_rpc_request(
+        {"method": "provider-add", "params": {"entry": {"id": "qwen"}}}
+    )
+    assert result["id"] == "qwen" and result["available_agents"] == {"qwen": True}
+    assert started == ["qwen"]
+
+    # A failed add never probes.
+    monkeypatch.setattr(provider_ops, "provider_add", lambda **_kw: {"error": "nope"})
+    daemon._handle_rpc_request(
+        {"method": "provider-add", "params": {"entry": {"id": "x"}}}
+    )
+    assert started == ["qwen"]
+
+
+def test_startup_sweep_reclaims_a_trashed_worktree_left_by_an_earlier_daemon(
+    daemon: MachineDaemon, home: Path
+):
+    """A removal parks the checkout under `.trash/` and reclaims it on a
+    background thread; a daemon that exits mid-reclaim leaves it behind, and
+    the next daemon finishes the job on start."""
+    from vicoa.rpc.worktree_ops import TRASH_DIR_NAME, wait_for_reclaims
+    from vicoa.rpc.worktree_paths import workspaces_root
+
+    leftover = workspaces_root() / "app-worktrees" / TRASH_DIR_NAME / "feat-1"
+    leftover.mkdir(parents=True)
+    (leftover / "junk.txt").write_text("junk\n")
+
+    daemon._sweep_worktree_trash()
+    wait_for_reclaims()
+
+    assert not leftover.exists()
+    assert not (workspaces_root() / "app-worktrees").exists()

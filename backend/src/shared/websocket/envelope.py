@@ -1,0 +1,232 @@
+"""Builders for WebSocket `update` payloads (websocket-migration plan §2.4-2.7).
+
+Each builder snapshots one canonical table row into a plain dict of JSON
+primitives — the `payload` of an `update` frame:
+
+    {"entity", "entity_id", "event_id", "body": {"t", ...}}
+
+Builders run inside the transaction (§2.7) and must return only JSON-
+serializable primitives: no lazy ORM attributes, UUIDs, datetimes, or enums.
+Mutable-entity bodies carry the complete table row so the §2.6 replace-merge
+is safe; joined/derived fields are never included (builders stay pure).
+"""
+
+from datetime import datetime
+from uuid import uuid4
+
+from ..database.models import (
+    AgentInstance,
+    Machine,
+    MachineSpawnRequest,
+    Message,
+)
+
+
+def _iso(value: datetime | None) -> str | None:
+    """Serialize a datetime as ISO-8601 with an explicit timezone marker.
+
+    The DB columns are TIMESTAMP WITHOUT TIME ZONE storing UTC clock values,
+    so SQLAlchemy returns naive datetimes. Bare `isoformat()` on a naive
+    datetime emits no timezone — Dart's `DateTime.parse` then interprets it
+    as LOCAL time and a session "just now" displays as e.g. "8h ago" for a
+    UTC+8 user. Always append "Z" (matches AgentInstanceResponse.serialize_datetime
+    in src/backend/models.py — REST and WS must agree on shape).
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.isoformat() + "Z"
+    return value.isoformat()
+
+
+def build_new_message_update(msg: Message) -> dict:
+    """`update` payload for a newly inserted `messages` row (append-only)."""
+    return {
+        "entity": "messages",
+        "entity_id": str(msg.id),
+        "event_id": f"{msg.id}:insert",
+        "body": {
+            "t": "new-message",
+            "id": str(msg.id),
+            "instance_id": str(msg.agent_instance_id),
+            "sender_type": msg.sender_type.value,
+            "sender_user_id": (
+                str(msg.sender_user_id) if msg.sender_user_id is not None else None
+            ),
+            "content": msg.content,
+            "created_at": _iso(msg.created_at),
+            "requires_user_input": msg.requires_user_input,
+            "message_metadata": msg.message_metadata,
+        },
+    }
+
+
+def build_message_update(msg: Message) -> dict:
+    """`update` payload for a metadata patch on an existing `messages` row.
+
+    Unlike `build_new_message_update` (append), this is a PATCH: clients
+    merge `message_metadata` into the message they already have rather than
+    inserting a new row. Used by the queue lifecycle to push
+    `message_metadata["queue"]["status"]` transitions without resending the
+    full message body.
+    """
+    status = (msg.message_metadata or {}).get("queue", {}).get("status")
+    return {
+        "entity": "messages",
+        "entity_id": str(msg.id),
+        "event_id": f"{msg.id}:queue:{status}",
+        "body": {
+            "t": "message-update",
+            "id": str(msg.id),
+            "instance_id": str(msg.agent_instance_id),
+            "message_metadata": msg.message_metadata,
+        },
+    }
+
+
+def _instance_row(
+    inst: AgentInstance, t: str, *, live_state: str | None = None
+) -> dict:
+    """Complete agent_instances row as JSON primitives (§2.4 mutable body).
+
+    `live_state` is set only by the WebSocket server, which knows whether the
+    agent's socket is present (servers/presence.py); the `backend` process
+    has no such registry and leaves it absent, and clients keep deriving
+    from the heartbeat timestamps in either case.
+    """
+    row = {
+        "t": t,
+        "id": str(inst.id),
+        # Wire key stays `user_agent_id` even though the column is now
+        # `agent_type_id` (P0.5 rename): shipped mobile builds read
+        # `body['user_agent_id']` in ws_client.dart and never force-upgrade, so
+        # renaming it would break every installed app. The local daemon mirrors
+        # this key in vicoa/local_server/envelopes.py — keep the two in step.
+        "user_agent_id": str(inst.agent_type_id),
+        "status": inst.status.value,
+        "name": inst.name,
+        "project": inst.project,
+        # The project the session is filed under; the sidebar groups on it,
+        # so a move (app or `vicoa session update --project`) regroups the
+        # row live instead of on the next list load.
+        "project_id": str(inst.project_id) if inst.project_id else None,
+        "home_dir": inst.home_dir,
+        "started_at": _iso(inst.started_at),
+        "ended_at": _iso(inst.ended_at),
+        "last_heartbeat_at": _iso(inst.last_heartbeat_at),
+        # Liveness inputs, not the derived verdict. `live_state` is a function
+        # of elapsed time, so a value sent here would be stale on arrival —
+        # clients re-derive it on a timer from this heartbeat plus the machine
+        # row they already receive via `build_machine_update`.
+        "machine_id": str(inst.machine_id) if inst.machine_id else None,
+        "instance_metadata": inst.instance_metadata,
+        "session_config": inst.session_config,
+        "has_git_changes": inst.git_diff is not None,
+        "updated_at": _iso(inst.updated_at),
+        "pinned_at": _iso(inst.pinned_at),
+    }
+    if live_state is not None:
+        row["live_state"] = live_state
+    return row
+
+
+def build_instance_created_update(inst: AgentInstance) -> dict:
+    """`update` payload for a newly registered agent instance."""
+    return {
+        "entity": "agent_instances",
+        "entity_id": str(inst.id),
+        "event_id": f"{inst.id}:insert",
+        "body": _instance_row(inst, "instance-created"),
+    }
+
+
+def build_instance_update(
+    inst: AgentInstance, *, live_state: str | None = None
+) -> dict:
+    """`update` payload for an agent instance status/metadata change."""
+    return {
+        "entity": "agent_instances",
+        "entity_id": str(inst.id),
+        "event_id": f"{inst.id}:update",
+        "body": _instance_row(inst, "instance-update", live_state=live_state),
+    }
+
+
+def build_machine_update(machine: Machine) -> dict:
+    """`update` payload for a machine heartbeat or metadata change."""
+    return {
+        "entity": "machines",
+        "entity_id": str(machine.id),
+        "event_id": f"{machine.id}:update",
+        "body": {
+            "t": "machine-update",
+            "id": str(machine.id),
+            "display_name": machine.display_name,
+            "hostname": machine.hostname,
+            "platform": machine.platform,
+            "home_dir": machine.home_dir,
+            "last_heartbeat_at": _iso(machine.last_heartbeat_at),
+            "machine_metadata": machine.machine_metadata,
+            "created_at": _iso(machine.created_at),
+            "updated_at": _iso(machine.updated_at),
+        },
+    }
+
+
+def build_spawn_request_update(req: MachineSpawnRequest) -> dict:
+    """`update` payload for a newly created spawn request (append-only event).
+
+    The `machine_spawn_requests` row mutates as the daemon claims and completes
+    it, but the `spawn-request` event fires once at creation; status changes
+    travel over REST (Phase 2). The body is a snapshot at creation time.
+    """
+    return {
+        "entity": "machine_spawn_requests",
+        "entity_id": str(req.id),
+        "event_id": f"{req.id}:insert",
+        "body": {
+            "t": "spawn-request",
+            "id": str(req.id),
+            "machine_id": str(req.machine_id),
+            "requested_by_user_id": str(req.requested_by_user_id),
+            "directory": req.directory,
+            "agent": req.agent,
+            "status": req.status,
+            "message": req.message,
+            "agent_instance_id": (
+                str(req.agent_instance_id)
+                if req.agent_instance_id is not None
+                else None
+            ),
+            "created_at": _iso(req.created_at),
+            "request_metadata": req.request_metadata,
+        },
+    }
+
+
+def build_access_changed_update(
+    *, project_id: str | None = None, instance_id: str | None = None
+) -> dict:
+    """`update` payload telling a user their access to something changed.
+
+    Sent to the *grantee's* user-scoped room when a project grant, a session
+    share or a team membership that confers access is added, changed or
+    removed (collaboration §9). It carries no row — access is not an entity
+    a client can merge — only what changed, so the client refetches what it
+    shows from it. Clients that predate it ignore an unknown `t`.
+    """
+    return {
+        "entity": "access",
+        "entity_id": project_id or instance_id or "",
+        "event_id": f"access:{uuid4()}",
+        "body": {
+            "t": "access-changed",
+            "project_id": project_id,
+            "instance_id": instance_id,
+        },
+    }
+
+
+def build_ephemeral(t: str, **fields: object) -> dict:
+    """Build an `ephemeral` frame body (`{"t", ...}`) for broadcast_ephemeral."""
+    return {"t": t, **fields}

@@ -1,0 +1,583 @@
+"""Teams API (collaboration §3.2).
+
+A team is a principal — a reusable bag of people that can hold a project grant
+and, later, own projects — not a tenant. This router covers the team itself,
+its members (email invites, accept/decline, roles, removal) and shareable
+join links. Seat gating is not here: the query layer asks
+`shared.hooks.check_capability`, and the app-level handler turns a denial
+into 402.
+
+Deliberately absent (D-D): no slug availability check and no public route
+that resolves a slug. The invite-link preview resolves a 256-bit *token*, is
+authenticated, and fails identically for unknown / revoked / expired /
+exhausted tokens.
+"""
+
+import logging
+from uuid import UUID
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from shared import storage
+from shared.database import Team, TeamInvite, TeamMember, User
+from shared.database.session import get_db
+from shared.images import InvalidImageError, process_image
+
+from ..auth.dependencies import get_current_user
+from ..db import collab_queries
+from ..email_service import email_is_configured, send_team_invite_email, web_url
+from ..db.collab_queries import (
+    InviteNotFoundError,
+    TeamConflictError,
+    TeamNotFoundError,
+    TeamPermissionError,
+)
+from ..models import (
+    TeamCreateRequest,
+    TeamDetailResponse,
+    TeamInvitationResponse,
+    TeamInviteCreateRequest,
+    TeamInvitePreviewResponse,
+    TeamInviteResponse,
+    TeamMemberInviteRequest,
+    TeamMemberInviteResponse,
+    TeamMemberResponse,
+    TeamMemberRoleUpdateRequest,
+    TeamOwnershipTransferRequest,
+    TeamSummary,
+    TeamUpdateRequest,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/teams", tags=["teams"])
+invite_router = APIRouter(prefix="/team-invites", tags=["teams"])
+
+# Where an emailed invite lands: Settings → Teams lists pending invitations
+# with Accept / Decline. Not a capability — it only shows an invitation to the
+# account that holds the invited address.
+TEAM_INVITATIONS_PATH = "/dashboard/settings?tab=teams"
+
+# Same bound and served types as user / agent avatars (backend/api/users.py is
+# the reference implementation, §3.1 as-built).
+MAX_AVATAR_UPLOAD_BYTES = 8 * 1024 * 1024
+_INLINE_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def avatar_served_url(team_id: UUID | str) -> str:
+    """Backend-relative URL clients render (stored in ``avatar_image_uri``)."""
+    return f"/api/v1/teams/{team_id}/avatar"
+
+
+# --- serializers --------------------------------------------------------------
+
+
+def _summary(team: Team, role: str, member_count: int) -> TeamSummary:
+    return TeamSummary(
+        id=team.id,
+        name=team.name,
+        slug=team.slug,
+        avatar_image_uri=team.avatar_image_uri,
+        role=role,  # type: ignore[arg-type]
+        member_count=member_count,
+        created_at=team.created_at,
+        updated_at=team.updated_at,
+    )
+
+
+def _summary_for(db: Session, user_id: UUID, team: Team) -> TeamSummary:
+    _, membership = collab_queries.require_team(db, user_id, team.id)
+    return _summary(team, membership.role, len(collab_queries.list_members(db, team)))
+
+
+def _member(member: TeamMember, *, show_email: bool) -> TeamMemberResponse:
+    user = member.user
+    return TeamMemberResponse(
+        id=member.id,
+        user_id=member.user_id,
+        # Email is identity only for a pending invite with no account yet;
+        # otherwise it is shown to owners/admins alone (§10.4).
+        email=(
+            (user.email if user else member.invited_email)
+            if show_email or (user is None and member.status == "invited")
+            else None
+        ),
+        display_name=user.display_name if user else None,
+        avatar_image_uri=user.avatar_image_uri if user else None,
+        role=member.role,  # type: ignore[arg-type]
+        status=member.status,  # type: ignore[arg-type]
+        lapsed_role=member.lapsed_role,  # type: ignore[arg-type]
+        joined_at=member.joined_at,
+        created_at=member.created_at,
+    )
+
+
+def _detail(db: Session, team: Team, membership: TeamMember) -> TeamDetailResponse:
+    members = collab_queries.list_members(db, team)
+    show_email = membership.role in ("owner", "admin")
+    return TeamDetailResponse(
+        **_summary(team, membership.role, len(members)).model_dump(),
+        members=[_member(m, show_email=show_email) for m in members],
+    )
+
+
+def _invite(invite: TeamInvite) -> TeamInviteResponse:
+    return TeamInviteResponse(
+        id=invite.id,
+        token=invite.token,
+        role=invite.role,  # type: ignore[arg-type]
+        expires_at=invite.expires_at,
+        max_uses=invite.max_uses,
+        uses=invite.uses,
+        created_at=invite.created_at,
+    )
+
+
+def _team_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, TeamNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, TeamPermissionError):
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    if isinstance(exc, TeamConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, InviteNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    raise exc
+
+
+# --- teams --------------------------------------------------------------------
+
+
+@router.get("", response_model=list[TeamSummary])
+def list_teams(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TeamSummary]:
+    return [
+        _summary(team, role, count)
+        for team, role, count in collab_queries.list_user_teams(db, current_user.id)
+    ]
+
+
+@router.post("", response_model=TeamDetailResponse, status_code=status.HTTP_201_CREATED)
+def create_team_endpoint(
+    request: TeamCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamDetailResponse:
+    try:
+        team = collab_queries.create_team(db, current_user, request.name)
+        _, membership = collab_queries.require_team(db, current_user.id, team.id)
+    except (TeamConflictError, TeamNotFoundError) as exc:
+        raise _team_error(exc) from exc
+    return _detail(db, team, membership)
+
+
+@router.get("/invitations", response_model=list[TeamInvitationResponse])
+def list_invitations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TeamInvitationResponse]:
+    """Email invites waiting on the caller.
+
+    Also the "login" half of invite-before-signup: the account menu loads this
+    on every dashboard visit, so project grants and session shares sent to the
+    caller's address attach here even when the account was first created by a
+    path that skipped the signup hook."""
+    collab_queries.claim_pending_invites(db, current_user)
+    out: list[TeamInvitationResponse] = []
+    for member in collab_queries.list_pending_invitations(db, current_user):
+        inviter = (
+            db.get(User, member.invited_by_user_id)
+            if member.invited_by_user_id
+            else None
+        )
+        out.append(
+            TeamInvitationResponse(
+                team_id=member.team.id,
+                name=member.team.name,
+                slug=member.team.slug,
+                avatar_image_uri=member.team.avatar_image_uri,
+                role=member.role,  # type: ignore[arg-type]
+                invited_by_display_name=inviter.display_name if inviter else None,
+                created_at=member.created_at,
+            )
+        )
+    return out
+
+
+@router.get("/{team_id}", response_model=TeamDetailResponse)
+def get_team_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamDetailResponse:
+    try:
+        team, membership = collab_queries.require_team(db, current_user.id, team_id)
+    except TeamNotFoundError as exc:
+        raise _team_error(exc) from exc
+    return _detail(db, team, membership)
+
+
+@router.patch("/{team_id}", response_model=TeamSummary)
+def update_team_endpoint(
+    team_id: UUID,
+    request: TeamUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamSummary:
+    try:
+        team = collab_queries.update_team(
+            db, current_user.id, team_id, name=request.name
+        )
+        _, membership = collab_queries.require_team(db, current_user.id, team_id)
+    except (TeamNotFoundError, TeamPermissionError) as exc:
+        raise _team_error(exc) from exc
+    return _summary(team, membership.role, len(collab_queries.list_members(db, team)))
+
+
+@router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_team_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    team = db.get(Team, team_id)
+    had_avatar = team is not None and bool(team.avatar_image_uri)
+    try:
+        collab_queries.delete_team(db, current_user.id, team_id)
+    except (TeamNotFoundError, TeamPermissionError) as exc:
+        raise _team_error(exc) from exc
+    if had_avatar:
+        _delete_avatar_object(team_id)
+
+
+@router.post("/{team_id}/transfer", response_model=TeamDetailResponse)
+def transfer_team_endpoint(
+    team_id: UUID,
+    request: TeamOwnershipTransferRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamDetailResponse:
+    """Make another active member the owner (owner only). The owner is who
+    pays for the team's seats (D-C), so the new owner's plan is asked first —
+    a 402 leaves the team as it was."""
+    try:
+        collab_queries.transfer_team_ownership(
+            db, current_user.id, team_id, request.member_id
+        )
+        team, membership = collab_queries.require_team(db, current_user.id, team_id)
+    except (TeamNotFoundError, TeamPermissionError, TeamConflictError) as exc:
+        raise _team_error(exc) from exc
+    return _detail(db, team, membership)
+
+
+# --- avatar -------------------------------------------------------------------
+
+
+def _delete_avatar_object(team_id: UUID) -> None:
+    try:
+        storage.delete_object(storage.team_avatar_key(str(team_id)))
+    except Exception:
+        # An orphaned S3 object is harmless; never fail the request on it.
+        logger.warning("team avatar S3 delete failed for %s", team_id)
+
+
+@router.put("/{team_id}/avatar", response_model=TeamSummary)
+def upload_team_avatar_endpoint(
+    team_id: UUID,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamSummary:
+    """Set the team's picture (owner/admin). Validated and re-encoded by
+    ``process_image``, stored under ``team-avatars/{team_id}``."""
+    try:
+        collab_queries.require_team(db, current_user.id, team_id, minimum="admin")
+    except (TeamNotFoundError, TeamPermissionError) as exc:
+        raise _team_error(exc) from exc
+    raw = file.file.read(MAX_AVATAR_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_AVATAR_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image exceeds {MAX_AVATAR_UPLOAD_BYTES // (1024 * 1024)}MB limit",
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="File is empty")
+    try:
+        processed = process_image(raw)
+    except InvalidImageError as exc:
+        raise HTTPException(
+            status_code=400, detail="Not a valid image in a supported format"
+        ) from exc
+    try:
+        storage.upload_attachment(
+            storage.team_avatar_key(str(team_id)),
+            processed.data,
+            processed.mime_type,
+        )
+    except Exception as exc:
+        logger.exception("team avatar upload to S3 failed")
+        raise HTTPException(status_code=502, detail="Failed to store image") from exc
+    team = collab_queries.set_team_avatar(
+        db, current_user.id, team_id, avatar_image_uri=avatar_served_url(team_id)
+    )
+    return _summary_for(db, current_user.id, team)
+
+
+@router.delete("/{team_id}/avatar", response_model=TeamSummary)
+def delete_team_avatar_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamSummary:
+    """Back to the generated initial (owner/admin)."""
+    try:
+        team = collab_queries.set_team_avatar(
+            db, current_user.id, team_id, avatar_image_uri=None
+        )
+    except (TeamNotFoundError, TeamPermissionError) as exc:
+        raise _team_error(exc) from exc
+    _delete_avatar_object(team_id)
+    return _summary_for(db, current_user.id, team)
+
+
+@router.get("/{team_id}/avatar")
+def get_team_avatar_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve the team's picture.
+
+    Authenticated but not membership-scoped, like ``GET /users/{id}/avatar``:
+    a team's picture is exactly what the surfaces that name it to outsiders
+    show — the owner badge on a project shared with you, an invitation, a
+    join-link preview — and the id has to be known already to ask."""
+    del current_user
+    team = db.get(Team, team_id)
+    if team is None or not team.avatar_image_uri:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Avatar not found"
+        )
+    try:
+        data, content_type = storage.download_object(
+            storage.team_avatar_key(str(team_id))
+        )
+    except Exception as exc:
+        logger.exception("team avatar download from S3 failed")
+        raise HTTPException(status_code=502, detail="Failed to fetch image") from exc
+    if content_type not in _INLINE_IMAGE_TYPES:
+        content_type = "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            # The URL is stable across replacements; clients cache-bust on the
+            # team's updated_at.
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# --- members ------------------------------------------------------------------
+
+
+@router.post(
+    "/{team_id}/members",
+    response_model=TeamMemberInviteResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def invite_member_endpoint(
+    team_id: UUID,
+    request: TeamMemberInviteRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamMemberInviteResponse:
+    """Invite by email. The invite exists whether or not mail goes out: a
+    server with no mail transport answers `email_sent: false` and the inviter
+    passes `join_url` on by hand."""
+    try:
+        member = collab_queries.invite_member(
+            db, current_user.id, team_id, email=request.email, role=request.role
+        )
+    except (TeamNotFoundError, TeamPermissionError, TeamConflictError) as exc:
+        raise _team_error(exc) from exc
+    join_url = web_url(TEAM_INVITATIONS_PATH)
+    email_sent = False
+    address = member.invited_email or (member.user.email if member.user else None)
+    if address and email_is_configured():
+        background_tasks.add_task(
+            send_team_invite_email,
+            address,
+            current_user.display_name or "",
+            member.team.name,
+            member.role,
+            join_url,
+        )
+        email_sent = True
+    return TeamMemberInviteResponse(
+        **_member(member, show_email=True).model_dump(),
+        email_sent=email_sent,
+        join_url=join_url,
+    )
+
+
+@router.post("/{team_id}/members/accept", response_model=TeamSummary)
+def accept_invitation_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamSummary:
+    try:
+        collab_queries.accept_invitation(db, current_user, team_id)
+        team, membership = collab_queries.require_team(db, current_user.id, team_id)
+    except TeamNotFoundError as exc:
+        raise _team_error(exc) from exc
+    return _summary(team, membership.role, len(collab_queries.list_members(db, team)))
+
+
+@router.post("/{team_id}/members/decline", status_code=status.HTTP_204_NO_CONTENT)
+def decline_invitation_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    try:
+        collab_queries.decline_invitation(db, current_user, team_id)
+    except TeamNotFoundError as exc:
+        raise _team_error(exc) from exc
+
+
+@router.patch("/{team_id}/members/{member_id}", response_model=TeamMemberResponse)
+def update_member_role_endpoint(
+    team_id: UUID,
+    member_id: UUID,
+    request: TeamMemberRoleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamMemberResponse:
+    try:
+        member = collab_queries.update_member_role(
+            db, current_user.id, team_id, member_id, role=request.role
+        )
+    except (TeamNotFoundError, TeamPermissionError, TeamConflictError) as exc:
+        raise _team_error(exc) from exc
+    return _member(member, show_email=True)
+
+
+@router.delete("/{team_id}/members/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_member_endpoint(
+    team_id: UUID,
+    member_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    try:
+        collab_queries.remove_member(db, current_user.id, team_id, member_id)
+    except (TeamNotFoundError, TeamPermissionError, TeamConflictError) as exc:
+        raise _team_error(exc) from exc
+
+
+# --- invite links -------------------------------------------------------------
+
+
+@router.get("/{team_id}/invites", response_model=list[TeamInviteResponse])
+def list_invites_endpoint(
+    team_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TeamInviteResponse]:
+    try:
+        invites = collab_queries.list_invite_links(db, current_user.id, team_id)
+    except (TeamNotFoundError, TeamPermissionError) as exc:
+        raise _team_error(exc) from exc
+    return [_invite(i) for i in invites]
+
+
+@router.post(
+    "/{team_id}/invites",
+    response_model=TeamInviteResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_invite_endpoint(
+    team_id: UUID,
+    request: TeamInviteCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamInviteResponse:
+    try:
+        invite = collab_queries.create_invite_link(
+            db,
+            current_user.id,
+            team_id,
+            role=request.role,
+            expires_in_days=request.expires_in_days,
+            max_uses=request.max_uses,
+        )
+    except (TeamNotFoundError, TeamPermissionError, TeamConflictError) as exc:
+        raise _team_error(exc) from exc
+    return _invite(invite)
+
+
+@router.delete("/{team_id}/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_invite_endpoint(
+    team_id: UUID,
+    invite_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    try:
+        collab_queries.revoke_invite_link(db, current_user.id, team_id, invite_id)
+    except (TeamNotFoundError, TeamPermissionError, InviteNotFoundError) as exc:
+        raise _team_error(exc) from exc
+
+
+@invite_router.get("/{token}", response_model=TeamInvitePreviewResponse)
+def preview_invite_endpoint(
+    token: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamInvitePreviewResponse:
+    """What the join page shows before the visitor commits. Authenticated —
+    a token is a capability to *join*, not a public page."""
+    del current_user
+    try:
+        invite = collab_queries.resolve_invite_link(db, token)
+    except InviteNotFoundError as exc:
+        raise _team_error(exc) from exc
+    return TeamInvitePreviewResponse(
+        team_id=invite.team.id,
+        name=invite.team.name,
+        avatar_image_uri=invite.team.avatar_image_uri,
+        role=invite.role,  # type: ignore[arg-type]
+        member_count=len(collab_queries.list_members(db, invite.team)),
+    )
+
+
+@invite_router.post("/{token}/accept", response_model=TeamSummary)
+def accept_invite_endpoint(
+    token: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamSummary:
+    try:
+        member = collab_queries.accept_invite_link(db, current_user, token)
+        team, membership = collab_queries.require_team(
+            db, current_user.id, member.team_id
+        )
+    except (InviteNotFoundError, TeamNotFoundError) as exc:
+        raise _team_error(exc) from exc
+    return _summary(team, membership.role, len(collab_queries.list_members(db, team)))

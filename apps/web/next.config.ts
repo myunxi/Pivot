@@ -1,0 +1,125 @@
+import type { NextConfig } from 'next';
+import { createMDX } from 'fumadocs-mdx/next';
+
+const withMDX = createMDX();
+
+const nextConfig: NextConfig = {
+  // Self-contained server build (`.next/standalone`) — consumed by the desktop
+  // packaging (apps/desktop/scripts/build-renderer.mjs); a no-op for the regular
+  // server deploy, which keeps using `next start`.
+  output: 'standalone',
+  // NOTE: ppr + clientSegmentCache (Next canary features) used to be enabled for
+  // the web deploy. They were removed: with `ppr: true` every prerendered route
+  // is marked partially-dynamic, so the Netlify Next runtime resumed each one
+  // through the serverless function on every request — even the fully-static
+  // marketing/docs/blog pages, which then never hit the CDN. That blew past the
+  // Netlify Functions invocation quota for zero benefit (auth state in the navbar
+  // is fetched client-side, so the server has no dynamic hole to postpone). With
+  // PPR off, those pages ship as pure static CDN assets and only the API routes
+  // and genuinely dynamic renders touch the function. Removing PPR also lets us
+  // run stable Next instead of canary (PPR is canary-only). The desktop build
+  // already ran with these off (they were the prime suspect for a Windows
+  // "blank main page" hang). Do not re-add PPR without re-checking Netlify usage.
+  async redirects() {
+    return [
+      // Sessions moved out from under the agent-presets prefix:
+      // /dashboard/agents/<instanceId> -> /dashboard/sessions/<instanceId>.
+      // `/dashboard/agents` (bare) is a different page — saved agent presets —
+      // and is deliberately NOT redirected. Old session links are in the wild
+      // (desktop notification payloads, share pages, bookmarks, PR bodies), so
+      // these stay. ORDER MATTERS: `new-session` has to be matched before the
+      // `:instanceId` wildcard, which would otherwise swallow it and send it to
+      // the non-existent /dashboard/sessions/new-session.
+      {
+        source: '/dashboard/agents/new-session',
+        destination: '/dashboard/sessions/new',
+        permanent: true,
+      },
+      {
+        source: '/dashboard/agents/:instanceId',
+        destination: '/dashboard/sessions/:instanceId',
+        permanent: true,
+      },
+      // `/cancel-subscription` is a short link to the help page, which is part
+      // of the open marketing site (always present), so it's unconditional.
+      {
+        source: '/cancel-subscription',
+        destination: '/help/cancel-subscription',
+        permanent: true,
+      },
+      // Folder indexes used to be linked as /docs/agents/index, which duplicated
+      // /docs/agents. Fold the alias into the canonical URL.
+      {
+        source: '/docs/:path*/index',
+        destination: '/docs/:path*',
+        permanent: true,
+      },
+      // Nested pages were briefly reachable at the top level (a stale
+      // generateStaticParams flattened the folder meta.json files). Point the
+      // strays at the real pages instead of leaving them to 404.
+      ...['claude-code', 'codex', 'opencode', 'more-coding-agents'].map((slug) => ({
+        source: `/docs/${slug}`,
+        destination: `/docs/agents/${slug}`,
+        permanent: true,
+      })),
+      ...['mobile-app', 'vicoa-cli'].map((slug) => ({
+        source: `/docs/${slug}`,
+        destination: `/docs/changelog/${slug}`,
+        permanent: true,
+      })),
+    ];
+  },
+  images: {
+    // AVIF first: ~30–50% smaller than WebP at equal sharpness, so we can serve
+    // denser images (crisp on low-DPI external monitors) without growing bytes.
+    formats: ['image/avif', 'image/webp'],
+    // Next's defaults plus 2400. The landing hero is 1152 CSS px wide, so a
+    // retina screen needs ~2304px; without a 2400 step it jumps to 3840, about
+    // twice the bytes.
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 2400, 3840],
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'startupfa.me',
+      },
+      {
+        protocol: 'https',
+        hostname: 'cdn.prod.website-files.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'fazier.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'similarlabs.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'launchigniter.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'twelve.tools',
+      },
+      {
+        protocol: 'https',
+        hostname: 'findly.tools',
+      },
+      {
+        protocol: 'https',
+        hostname: 'img.turbo0.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'embed.filekitcdn.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'cdn.aidirectori.es',
+      },
+    ],
+  },
+};
+
+export default withMDX(nextConfig);

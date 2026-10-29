@@ -1,0 +1,366 @@
+"""Worktree lifecycle execution engine — success, failure, env, stream, bounds.
+
+POSIX-only (the engine runs commands under ``bash``); skipped on Windows, where
+the shell path differs. Commands are trivial builtins so the suite stays fast and
+hermetic — no network, no package installs.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from vicoa.rpc import worktree_setup as ws
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="engine tests assume bash")
+
+
+def _run(commands: list[str], *, worktree: Path, hook: ws.HookName = "setup", **kw):
+    return ws.run_commands(
+        commands,
+        hook=hook,
+        worktree_path=str(worktree),
+        source_repo=str(worktree),
+        branch_name="feat/x",
+        **kw,
+    )
+
+
+class TestRunCommands:
+    def test_empty_is_vacuous_success(self, tmp_path: Path) -> None:
+        result = _run([], worktree=tmp_path)
+        assert result.ok
+        assert result.results == []
+
+    def test_success_captures_output(self, tmp_path: Path) -> None:
+        result = _run(["echo hello"], worktree=tmp_path)
+        assert result.ok
+        assert result.results[0].exit_code == 0
+        assert "hello" in result.results[0].output
+
+    def test_nonzero_exit_fails_and_stops(self, tmp_path: Path) -> None:
+        marker = tmp_path / "ran_second"
+        result = _run(
+            ["exit 3", f"touch {marker}"],
+            worktree=tmp_path,
+        )
+        assert not result.ok
+        # Only the first command ran; the second never fired.
+        assert len(result.results) == 1
+        assert result.results[0].exit_code == 3
+        assert not marker.exists()
+        assert result.failed_result is result.results[0]
+
+    def test_runs_in_worktree_cwd(self, tmp_path: Path) -> None:
+        result = _run(["pwd"], worktree=tmp_path)
+        assert str(tmp_path.resolve()) in result.results[0].output
+
+    def test_injects_env(self, tmp_path: Path) -> None:
+        result = ws.run_commands(
+            ['echo "$VICOA_WORKTREE_PATH|$VICOA_BRANCH_NAME|$VICOA_PROJECT_ID"'],
+            hook="setup",
+            worktree_path=str(tmp_path),
+            source_repo=str(tmp_path),
+            branch_name="feat/x",
+            project_id="proj-123",
+        )
+        out = result.results[0].output
+        assert str(tmp_path) in out
+        assert "feat/x" in out
+        assert "proj-123" in out
+
+    def test_keeps_the_callers_path_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A login bash re-runs /etc/profile, and macOS's path_helper there moves
+        # /usr/bin ahead of the daemon's PATH, so `python3` became the system one.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "python3"
+        stub.write_text("#!/bin/sh\necho stub\n")
+        stub.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+        result = _run(["command -v python3"], worktree=tmp_path)
+        assert result.results[0].output.strip() == str(stub)
+
+    def test_worktree_env_vars_expands_and_normalises_paths(self) -> None:
+        env = ws.worktree_env_vars(
+            worktree_path="~/wt//",
+            source_repo="~/repo/",
+            branch_name="feat/x",
+        )
+        home = os.path.expanduser("~")
+        # ~-expanded and slash-normalised, so `cp "$VICOA_ROOT_PATH/..."` typed
+        # into the terminal resolves a real path (a literal ~ would not).
+        assert env["VICOA_ROOT_PATH"] == os.path.join(home, "repo")
+        assert env["VICOA_WORKTREE_PATH"] == os.path.join(home, "wt")
+        assert "VICOA_SOURCE_CHECKOUT_PATH" not in env
+
+
+class TestStreaming:
+    def test_events_bracket_each_command(self, tmp_path: Path) -> None:
+        events: list[ws.SetupEvent] = []
+        _run(["echo streamed"], worktree=tmp_path, on_event=events.append)
+        types = [e.type for e in events]
+        assert types[0] == "command_started"
+        assert types[-1] == "command_completed"
+        assert "output" in types
+        assert any(e.type == "output" and "streamed" in (e.chunk or "") for e in events)
+
+
+class TestTimeoutAndAbort:
+    def test_command_timeout_kills(self, tmp_path: Path) -> None:
+        start = time.monotonic()
+        result = _run(["sleep 30"], worktree=tmp_path, command_timeout_s=0.3)
+        elapsed = time.monotonic() - start
+        assert elapsed < 10  # killed, not waited out
+        assert result.results[0].timed_out
+        assert not result.ok
+
+    def test_preset_abort_short_circuits(self, tmp_path: Path) -> None:
+        abort = threading.Event()
+        abort.set()
+        result = _run(["sleep 30"], worktree=tmp_path, abort=abort)
+        assert result.aborted
+        assert result.results == []  # loop guard fired before running anything
+
+    def test_mid_command_abort_kills(self, tmp_path: Path) -> None:
+        abort = threading.Event()
+        threading.Timer(0.2, abort.set).start()
+        start = time.monotonic()
+        result = _run(["sleep 30"], worktree=tmp_path, abort=abort)
+        elapsed = time.monotonic() - start
+        assert elapsed < 10
+        assert result.aborted
+        assert result.results[0].aborted
+
+
+class TestBoundedOutput:
+    def test_truncates_large_output(self) -> None:
+        buf = ws._BoundedOutput(max_bytes=1024)
+        buf.append("A" * 5000)
+        rendered = buf.render()
+        assert ws._TRUNCATION_MARKER in rendered
+        assert len(rendered.encode()) < 2000
+
+    def test_small_output_not_truncated(self) -> None:
+        buf = ws._BoundedOutput(max_bytes=1024)
+        buf.append("small")
+        assert buf.render() == "small"
+
+
+class TestReadCommittedConfig:
+    def test_reads_setup_and_teardown(self, tmp_path: Path) -> None:
+        (tmp_path / "vicoa.json").write_text(
+            json.dumps(
+                {"worktree": {"setup": ["npm ci"], "teardown": "rm -rf node_modules"}}
+            )
+        )
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == ["npm ci"]
+        assert ws.read_committed_config_commands(str(tmp_path), "teardown") == [
+            "rm -rf node_modules"
+        ]
+
+    def test_missing_file_is_empty(self, tmp_path: Path) -> None:
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == []
+
+    def test_malformed_json_is_empty(self, tmp_path: Path) -> None:
+        (tmp_path / "vicoa.json").write_text("{ not json")
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == []
+
+    def test_reads_dot_vicoa_config_json(self, tmp_path: Path) -> None:
+        vicoa_dir = tmp_path / ".vicoa"
+        vicoa_dir.mkdir()
+        (vicoa_dir / "config.json").write_text(
+            json.dumps({"worktree": {"setup": ["pnpm i"]}})
+        )
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == ["pnpm i"]
+
+    def test_dot_vicoa_takes_precedence_over_root(self, tmp_path: Path) -> None:
+        vicoa_dir = tmp_path / ".vicoa"
+        vicoa_dir.mkdir()
+        (vicoa_dir / "config.json").write_text(
+            json.dumps({"worktree": {"setup": ["from-dotdir"]}})
+        )
+        (tmp_path / "vicoa.json").write_text(
+            json.dumps({"worktree": {"setup": ["from-root"]}})
+        )
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == [
+            "from-dotdir"
+        ]
+
+    def test_empty_dot_vicoa_falls_through_to_root(self, tmp_path: Path) -> None:
+        vicoa_dir = tmp_path / ".vicoa"
+        vicoa_dir.mkdir()
+        # Present but empty (no worktree hooks) → the root file still wins.
+        (vicoa_dir / "config.json").write_text(json.dumps({"other": 1}))
+        (tmp_path / "vicoa.json").write_text(
+            json.dumps({"worktree": {"setup": ["from-root"]}})
+        )
+        assert ws.read_committed_config_commands(str(tmp_path), "setup") == [
+            "from-root"
+        ]
+
+
+class TestRunWorktreeSetup:
+    def test_no_config_is_vacuous_success(self, tmp_path: Path) -> None:
+        result = ws.run_worktree_setup(str(tmp_path), str(tmp_path))
+        assert result.ok
+        assert result.results == []
+
+    def test_runs_setup_from_source_repo_in_worktree(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        worktree = tmp_path / "wt"
+        source.mkdir()
+        worktree.mkdir()
+        # Config comes from the SOURCE repo; the command runs in the WORKTREE.
+        (source / "vicoa.json").write_text(
+            json.dumps({"worktree": {"setup": ["pwd > ran.txt"]}})
+        )
+        result = ws.run_worktree_setup(str(worktree), str(source))
+        assert result.ok
+        assert (worktree / "ran.txt").exists()
+        assert str(worktree.resolve()) in (worktree / "ran.txt").read_text()
+
+
+class TestRunWorktreeTeardown:
+    def test_no_config_is_vacuous_success(self, tmp_path: Path) -> None:
+        result = ws.run_worktree_teardown(str(tmp_path), str(tmp_path))
+        assert result.ok
+        assert result.results == []
+
+    def test_runs_teardown_from_worktree_config(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        marker = worktree / "torn_down"
+        (worktree / "vicoa.json").write_text(
+            json.dumps({"worktree": {"teardown": [f"touch {marker}"]}})
+        )
+        result = ws.run_worktree_teardown(str(worktree), str(tmp_path))
+        assert result.ok
+        assert marker.exists()
+
+    def test_teardown_failure_is_reported_not_raised(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "vicoa.json").write_text(
+            json.dumps({"worktree": {"teardown": "exit 1"}})
+        )
+        result = ws.run_worktree_teardown(str(worktree), str(tmp_path))
+        assert not result.ok
+        assert result.results[0].exit_code == 1
+
+
+class TestSetupRunRecorder:
+    """Run records: what `worktree-setup-status` reads back."""
+
+    @pytest.fixture(autouse=True)
+    def _home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # Records live under ~/.vicoa; keep the suite hermetic.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+
+    def test_records_each_step_and_the_outcome(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        commands = ["echo one", "exit 2", "echo never"]
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree), source_repo=str(tmp_path), commands=commands
+        )
+        # Fresh record: running, every step pending.
+        initial = ws.read_setup_status(str(worktree))
+        assert initial["status"] == "running"
+        assert initial["total"] == 3
+        assert [c["status"] for c in initial["commands"]] == ["pending"] * 3
+        assert initial["source_repo"] == str(tmp_path)
+
+        result = _run(commands, worktree=worktree, on_event=recorder)
+        recorder.finish(result)
+
+        status = ws.read_setup_status(str(worktree))
+        assert status["status"] == "failed"
+        assert status["finished_at"] is not None
+        assert [c["status"] for c in status["commands"]] == ["ok", "failed", "pending"]
+        assert status["commands"][0]["exit_code"] == 0
+        assert status["commands"][1]["exit_code"] == 2
+        assert status["commands"][1]["duration_ms"] is not None
+        # The log carries the command echo, its output, and each exit.
+        tail = status["output_tail"]
+        assert "$ echo one" in tail
+        assert "one" in tail
+        assert "→ exit 2" in tail
+        assert Path(status["log_path"]).is_file()
+
+    def test_success_and_same_path_variants_share_a_record(
+        self, tmp_path: Path
+    ) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree), source_repo=str(tmp_path), commands=["true"]
+        )
+        recorder.finish(_run(["true"], worktree=worktree, on_event=recorder))
+        # Trailing slash / symlink-free variants resolve to the same record.
+        assert ws.read_setup_status(str(worktree) + "/")["status"] == "succeeded"
+
+    def test_tail_is_bounded_and_starts_on_a_line(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree),
+            source_repo=str(tmp_path),
+            commands=["seq 1 5000"],
+        )
+        recorder.finish(_run(["seq 1 5000"], worktree=worktree, on_event=recorder))
+        status = ws.read_setup_status(str(worktree), tail_bytes=1024)
+        tail = status["output_tail"]
+        assert len(tail.encode()) <= 1024
+        assert tail.endswith("→ exit 0\n")
+        # Dropped the partial first line, so the tail begins with a whole number.
+        first = tail.split("\n", 1)[0]
+        assert first.isdigit()
+
+    def test_engine_exception_is_recorded_as_failed(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree), source_repo=str(tmp_path), commands=["true"]
+        )
+        recorder.fail("boom")
+        status = ws.read_setup_status(str(worktree))
+        assert status["status"] == "failed"
+        assert "boom" in status["output_tail"]
+
+    def test_clear_forgets_the_record(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree), source_repo=str(tmp_path), commands=["true"]
+        )
+        recorder.finish(_run(["true"], worktree=worktree, on_event=recorder))
+        ws.clear_setup_record(str(worktree))
+        assert ws.read_setup_status(str(worktree)) == {"status": "none"}
+        # Idempotent.
+        ws.clear_setup_record(str(worktree))
+
+    def test_missing_record_reads_none(self, tmp_path: Path) -> None:
+        assert ws.read_setup_status(str(tmp_path / "nope")) == {"status": "none"}
+
+    def test_status_is_found_from_a_subfolder_of_the_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        worktree = tmp_path / "wt"
+        (worktree / "apps" / "web").mkdir(parents=True)
+        recorder = ws.SetupRunRecorder(
+            worktree_path=str(worktree), source_repo=str(tmp_path), commands=["true"]
+        )
+        recorder.finish(_run(["true"], worktree=worktree, on_event=recorder))
+        # A monorepo session's cwd is a subfolder; the record is keyed by the root.
+        status = ws.read_setup_status(str(worktree / "apps" / "web"))
+        assert status["status"] == "succeeded"
+        assert status["worktree_path"] == str(worktree)

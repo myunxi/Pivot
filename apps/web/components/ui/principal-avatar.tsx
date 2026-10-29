@@ -1,0 +1,237 @@
+'use client';
+
+/**
+ * PrincipalAvatar — the ONE way an identity is drawn (collaboration P0).
+ *
+ * Three principal types (user, team, agent) share one component and one
+ * fallback chain, so a person looks the same in the sidebar, on a task, in a
+ * share dialog and on a public share page:
+ *
+ *   1. the stored image, served from our own storage through the authed proxy;
+ *   2. a picked emoji, bare — no disc behind it;
+ *   3. initials on the deterministic paseo hash-palette color (`lib/principals`);
+ *   4. a generic per-type glyph, when there is no name to make initials from.
+ *
+ * Every principal is a circle. An agent used to be a rounded square ("it is a
+ * thing, not a face"), but the distinction cost more than it bought: every
+ * editor affordance drawn on top of an avatar (the hover scrim, the camera
+ * badge) is round, so a square agent avatar hovered into a grey circle that did
+ * not fit it. One shape, one hover state, everywhere. The one opt-out is
+ * `plain`, which drops the disc for rows that sit beside bare provider glyphs.
+ *
+ * Nothing else should render an avatar `<img>`: hot-linking an identity
+ * provider's CDN leaks a viewer's IP to it, and hashed-email services like
+ * avatar.vercel.sh / gravatar put an email on the wire. On a shared or public
+ * surface a principal may show a display name and a picture, never an email —
+ * see the `name` prop on `Principal`. Where the picture is fetched from is the
+ * surface's call (`PrincipalAvatarSrcProvider`): the dashboard's cookie proxy
+ * by default, the token-scoped public route on a share page.
+ */
+
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Bot, User as UserIcon, Users } from 'lucide-react';
+
+import { cn } from '@/lib/utils';
+import {
+  type Principal,
+  type PrincipalType,
+  principalAvatarSrc,
+  principalColor,
+  principalInitial,
+} from '@/lib/principals';
+
+export type PrincipalAvatarSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl';
+
+// Box size, plus the type size the initial needs to sit right inside it.
+// The letter runs ~0.25-0.30 of the box (it climbs at the small end only
+// because 16px has a legibility floor): a monogram wants to read as a mark
+// inside the circle, not fill it. Keep the Flutter twin's table in step.
+// An emoji is a picture, not a letter, and it sits bare in the circle's slot
+// (see below): sized to fill most of the box (~0.8), so it reads the same size
+// as a photo or monogram beside it. Its own column rather than reusing `text`.
+const SIZES: Record<
+  PrincipalAvatarSize,
+  { box: string; text: string; emoji: string; glyph: string }
+> = {
+  xs: { box: 'size-4', text: 'text-[8px]', emoji: 'text-[13px]', glyph: 'size-2.5' },
+  sm: { box: 'size-6', text: 'text-[9px]', emoji: 'text-[19px]', glyph: 'size-3.5' },
+  md: { box: 'size-8', text: 'text-[11px]', emoji: 'text-[26px]', glyph: 'size-4' },
+  lg: { box: 'size-14', text: 'text-base', emoji: 'text-[44px]', glyph: 'size-7' },
+  // Profile pages, where the avatar is the page's subject rather than a label.
+  xl: { box: 'size-20', text: 'text-xl', emoji: 'text-[64px]', glyph: 'size-9' },
+};
+
+// `plain` marks are sized like the icons they sit beside — at `xs`, a 12px
+// provider glyph in a 16px text row: the slot is as tall as the disc would be
+// (`line` is that height as a line-height, see the prop) but only as wide as
+// the icon, so the label after a plain mark starts where it does after an
+// icon, and the mark's left edge sits on the same column.
+const PLAIN: Record<
+  PrincipalAvatarSize,
+  { box: string; line: string; image: string; glyph: string }
+> = {
+  xs: { box: 'h-4 w-3', line: 'leading-4', image: 'size-3', glyph: 'size-3' },
+  sm: { box: 'h-6 w-4', line: 'leading-6', image: 'size-4', glyph: 'size-4' },
+  md: { box: 'h-8 w-5', line: 'leading-8', image: 'size-5', glyph: 'size-5' },
+  lg: { box: 'h-14 w-7', line: 'leading-14', image: 'size-7', glyph: 'size-7' },
+  xl: { box: 'h-20 w-9', line: 'leading-20', image: 'size-9', glyph: 'size-9' },
+};
+
+// A team is a bag of people; an agent is not a person at all. Only the user
+// falls back to the single-person glyph.
+const GLYPHS: Record<PrincipalType, typeof UserIcon> = {
+  user: UserIcon,
+  team: Users,
+  agent: Bot,
+};
+
+type PrincipalAvatarSrcResolver = (principal: Principal) => string | null;
+
+const PrincipalAvatarSrcContext = createContext<PrincipalAvatarSrcResolver>(principalAvatarSrc);
+
+/**
+ * Where a principal's image comes from on this surface. The dashboard needs
+ * no provider — `principalAvatarSrc` names the cookie-authed proxy. A public
+ * share page has no cookie to send, so it points every avatar under it at the
+ * share-scoped backend route instead, where the link token authorizes the
+ * fetch (the same arrangement as `AttachmentUrlProvider`). One provider at
+ * the root reaches every slot — the owner card, an assignee chip, a comment
+ * author — without each caller knowing which surface it is on.
+ */
+export function PrincipalAvatarSrcProvider({
+  resolve,
+  children,
+}: {
+  resolve: PrincipalAvatarSrcResolver;
+  children: ReactNode;
+}) {
+  const value = useMemo(() => resolve, [resolve]);
+  return <PrincipalAvatarSrcContext.Provider value={value}>{children}</PrincipalAvatarSrcContext.Provider>;
+}
+
+export function PrincipalAvatar({
+  principal,
+  size = 'md',
+  className,
+  title,
+  plain = false,
+}: {
+  principal: Principal;
+  size?: PrincipalAvatarSize;
+  className?: string;
+  /** Tooltip text. Defaults to `principal.name`. */
+  title?: string;
+  /**
+   * No disc: the mark sits directly on the row, the way a provider glyph does,
+   * at the icon's size (`PLAIN`). For a list that mixes saved agents with bare
+   * provider icons (the agent picker), a disc on every other row is the odd
+   * one out. A stored image keeps its circular clip — a picture needs a
+   * shape, a glyph does not.
+   *
+   * A plain emoji or initial is typeset like the text beside it — inherited
+   * font size, line-height equal to the box — so it sits on the same baseline
+   * as that text, which is the alignment emoji fonts are drawn for. Centring
+   * a smaller glyph in the box instead (the disc's recipe) leaves an emoji
+   * visibly high: its ink is not centred on its own em box.
+   */
+  plain?: boolean;
+}) {
+  const dims = SIZES[size];
+  const flat = PLAIN[size];
+  const box = cn('shrink-0', plain ? flat.box : dims.box, className);
+  const disc = cn('shrink-0 overflow-hidden rounded-full', plain ? flat.image : dims.box, className);
+  const label = title ?? principal.name ?? undefined;
+
+  const src = useContext(PrincipalAvatarSrcContext)(principal);
+  // Any image can 404 — after a replacement, or on a share page for a
+  // principal the link does not cover — and the next rung of the chain is the
+  // right answer then, not a broken-image glyph. Reset when the src changes
+  // so a fixed image gets another chance.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  useEffect(() => {
+    setFailedSrc(null);
+  }, [src]);
+  if (src && failedSrc !== src) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element -- authed proxy stream, not a static asset
+      <img
+        src={src}
+        alt=""
+        aria-hidden="true"
+        title={label}
+        className={cn('object-cover', disc)}
+        onError={() => setFailedSrc(src)}
+      />
+    );
+  }
+
+  // No disc: an emoji already carries its own colour and shape, and any fill
+  // behind it (the hash-palette colour, or the muted neutral it used to sit on)
+  // reads as a second badge around the first. The round slot stays — same box,
+  // same `rounded-full` — so every overlay drawn on an avatar still fits it;
+  // only its clipping goes, or the circle would shave the corners off a square
+  // emoji. A caller's separating ring (`ring-1 ring-background` in an avatar
+  // stack, on an owner badge) is dropped too: around a bare emoji it draws the
+  // very circle this removes, most visibly on the sidebar, whose surface is
+  // not the `background` colour the ring is painted in.
+  // Plain: flush left, not centred. An emoji glyph's advance box is wider than
+  // its ink (Apple Color Emoji carries a right-side bearing) and wider than
+  // the slot, so centring it hangs the ink over the column's left edge by a
+  // pixel or so; starting it at the edge lines it up with the icon column.
+  if (principal.emoji) {
+    return (
+      <span
+        title={label}
+        aria-hidden="true"
+        className={cn(
+          'inline-flex items-center',
+          plain
+            ? cn('justify-start', flat.line, box, 'ring-0')
+            : cn('justify-center leading-none', dims.emoji, disc, 'overflow-visible ring-0'),
+        )}
+      >
+        {principal.emoji}
+      </span>
+    );
+  }
+
+  // A principal with no id is a placeholder, not a person — "Owner" on a public
+  // page whose link hides the owner, "Deleted user" — and a monogram would
+  // invent an identity mark for it. Those get the glyph (`principalForAvatar`
+  // makes the same call for a name-less viewer).
+  const initial = principal.id ? principalInitial(principal.name) : null;
+  if (initial) {
+    // Without a disc the letter is the whole mark, so it takes the palette
+    // colour itself, and the 0.25-0.30 ratio above no longer applies: that is
+    // about fitting inside a circle, and there is no circle to fit.
+    return (
+      <span
+        title={label}
+        aria-hidden="true"
+        style={plain ? { color: principalColor(principal) } : { backgroundColor: principalColor(principal) }}
+        className={cn(
+          'inline-flex items-center justify-center uppercase',
+          plain
+            ? cn('font-semibold', flat.line, box)
+            : cn('font-normal leading-none text-white', dims.text, disc),
+        )}
+      >
+        {initial}
+      </span>
+    );
+  }
+
+  const Glyph = GLYPHS[principal.type];
+  return (
+    <span
+      title={label}
+      aria-hidden="true"
+      className={cn(
+        'inline-flex items-center justify-center text-muted-foreground',
+        plain ? box : cn('bg-muted', disc),
+      )}
+    >
+      <Glyph className={plain ? flat.glyph : dims.glyph} />
+    </span>
+  );
+}

@@ -1,0 +1,434 @@
+// Terminal pane patterns adapted from Orca (https://github.com/stablyai/orca),
+// MIT License, Copyright (c) 2026 Lovecast Inc.
+//
+// <TerminalPane> mounts one xterm.js terminal bound to a PtyTransport.
+// Construction order (Orca's pane-lifecycle): new Terminal -> open(container)
+// -> load fit/search/unicode11/webLinks addons -> activate unicode11 ->
+// initial fit deferred to rAF -> spawn. Disposal runs the reverse order.
+//
+// xterm touches `self` at module-eval time, so it must never load during SSR:
+// the JS modules are dynamically imported inside the mount effect ('use
+// client' alone is not enough — client components still server-render).
+
+'use client';
+
+import '@xterm/xterm/css/xterm.css';
+// Bundled "Symbols Nerd Font Mono" @font-face (powerline + Nerd Font glyphs).
+import './terminal-fonts.css';
+// Modifier-aware pointer cursor over links (see terminal-links.ts).
+import './terminal-links.css';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Terminal } from '@xterm/xterm';
+import type { PtyTransport } from './pty-transport';
+import { buildTerminalOptions, VICOA_TERMINAL_BACKGROUND } from './terminal-options';
+import { openTerminalLink, trackLinkModifier } from './terminal-links';
+import { isLineEditorReady, prepareInitialInput } from './initial-input';
+import { RpcError } from '@/lib/ws-client';
+
+const RESIZE_DEBOUNCE_MS = 50;
+
+/** Turn a spawn failure into something the user can act on. A remote machine
+ *  whose daemon predates remote-terminal support answers `no_handler`; an
+ *  offline machine answers `target_disconnected`. */
+function describeSpawnError(err: unknown): string {
+  if (err instanceof RpcError) {
+    if (err.code === 'no_handler') {
+      return "This machine's Vicoa needs updating to open a terminal from another device.";
+    }
+    if (err.code === 'target_disconnected') {
+      return 'That machine is offline.';
+    }
+  }
+  return err instanceof Error ? err.message : 'Failed to start terminal';
+}
+
+export interface TerminalPaneProps {
+  /** Factory, not an instance: the pane creates a fresh transport per mount so
+   *  React StrictMode's dev-only mount → unmount → mount can't spawn onto a
+   *  transport its own cleanup already killed ("PtyTransport is closed"). */
+  createTransport: () => PtyTransport;
+  cwd: string;
+  className?: string;
+  /** Written to the shell once, right after its first output (or a short
+   *  fallback delay) — the legacy old-daemon path types worktree setup here.
+   *  Sent on the first spawn only; a manual restart does not resend it. */
+  initialInput?: string;
+}
+
+// `initialInput` may only be typed once the shell's line editor is reading —
+// input written while it's still sourcing rc files overflows the tty's small
+// input queue (1024 bytes on macOS) and the tail, CR included, is dropped. The
+// bracketed-paste-on sequence says so exactly (see ./initial-input); seeing it
+// also means the shell takes a bracketed paste, which is how the text is then
+// handed over — a line editor loaded with per-keystroke widgets (oh-my-zsh +
+// syntax highlighting) cannot drain a typed 1.5KB chain fast enough to keep the
+// queue from overflowing either.
+//
+// Two fallbacks cover shells that never announce bracketed paste, and BOTH are
+// keyed off the shell having spoken at least once. A stock oh-my-zsh + starship
+// prints nothing at all for the first ~1.5s while it sources rc files: arming
+// the quiet timer at spawn (as this did) fired it into a shell that was not yet
+// reading, which is the 1024-byte-truncated setup chain. So: quiet only counts
+// after the first output, and the ceiling refuses to fire while the shell is
+// still silent (it waits another round instead).
+const INITIAL_INPUT_QUIET_MS = 300;
+const INITIAL_INPUT_MAX_WAIT_MS = 8000;
+// Gap between chunks, so the shell drains each one before the next lands.
+const INITIAL_INPUT_CHUNK_DELAY_MS = 20;
+
+type PaneStatus =
+  | { kind: 'loading' }
+  | { kind: 'spawning' }
+  | { kind: 'running' }
+  | { kind: 'exited'; exitCode: number | null }
+  | { kind: 'error'; message: string };
+
+export function TerminalPane({
+  createTransport,
+  cwd,
+  className,
+  initialInput,
+}: TerminalPaneProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // The terminal lives in refs so parent re-renders never touch it. The
+  // transport factory is read through a ref at effect start: prop-identity
+  // churn must not re-spawn — only a real cwd change does (effect deps below).
+  const createTransportRef = useRef(createTransport);
+  createTransportRef.current = createTransport;
+  // Read at effect start like the transport factory — `initialInput` is fixed
+  // per tab, so it must not be an effect dep (that would re-spawn the shell).
+  const initialInputRef = useRef(initialInput);
+  initialInputRef.current = initialInput;
+  const termRef = useRef<Terminal | null>(null);
+  const respawnRef = useRef<(() => void) | null>(null);
+  const [status, setStatus] = useState<PaneStatus>({ kind: 'loading' });
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    // Fresh transport per effect-run (StrictMode-safe): this run owns its
+    // spawn → kill lifecycle end to end.
+    const boundTransport = createTransportRef.current();
+    let disposed = false;
+    let observer: ResizeObserver | null = null;
+    let fitTimer: number | null = null;
+    let initialFitRafId: number | null = null;
+    const unsubs: Array<() => void> = [];
+
+    // Worktree setup: one-shot input written once the shell is live, then
+    // cleared so a manual restart (which reuses spawn/onData) never resends it.
+    let pendingInitialInput = initialInputRef.current || null;
+    // Set once the shell advertises bracketed paste, so the input goes over as
+    // a paste rather than as 1.5KB of simulated keystrokes. Stays false for a
+    // shell that never says so (then only the timers below release the input).
+    let bracketedPasteOn = false;
+    // Whether the shell has printed a single byte yet. Until it has, it is
+    // still sourcing rc files and is not reading stdin, so nothing may be
+    // written to it — see releaseOnDeadline.
+    let sawOutput = false;
+    let initialInputTimer: number | null = null;
+    let initialInputDeadline: number | null = null;
+    let chunkTimer: number | null = null;
+    const clearInitialInputTimers = (): void => {
+      if (initialInputTimer !== null) {
+        window.clearTimeout(initialInputTimer);
+        initialInputTimer = null;
+      }
+      if (initialInputDeadline !== null) {
+        window.clearTimeout(initialInputDeadline);
+        initialInputDeadline = null;
+      }
+    };
+    // Fed in queue-sized bites rather than one write: a setup chain runs well
+    // past the tty's 1024-byte input queue, and anything that doesn't fit while
+    // the shell isn't reading is dropped outright. `prepareInitialInput` also
+    // frames it as a paste when the shell supports one.
+    const writeChunked = (data: string): void => {
+      const chunks = prepareInitialInput(data, { bracketedPaste: bracketedPasteOn });
+      let next = 0;
+      const step = (): void => {
+        chunkTimer = null;
+        if (disposed || next >= chunks.length) return;
+        boundTransport.write(chunks[next]);
+        next += 1;
+        if (next < chunks.length) {
+          chunkTimer = window.setTimeout(step, INITIAL_INPUT_CHUNK_DELAY_MS);
+        }
+      };
+      step();
+    };
+    const flushInitialInput = (): void => {
+      clearInitialInputTimers();
+      if (pendingInitialInput === null || disposed) return;
+      const data = pendingInitialInput;
+      pendingInitialInput = null;
+      writeChunked(data);
+    };
+    /** Arm (and re-arm) the quiet timer on each burst of shell output, so the
+     *  fallback only ever fires against a shell that has started talking; the
+     *  deadline below keeps a never-quiet shell from deferring setup forever. */
+    const deferInitialInput = (): void => {
+      if (pendingInitialInput === null || disposed) return;
+      if (initialInputTimer !== null) window.clearTimeout(initialInputTimer);
+      initialInputTimer = window.setTimeout(flushInitialInput, INITIAL_INPUT_QUIET_MS);
+    };
+    /** Last-resort release, for a shell that talks but never announces
+     *  bracketed paste and never pauses long enough for the quiet timer.
+     *  A shell that has printed NOTHING is a different case: it isn't reading
+     *  stdin either (a cold zsh can spend seconds in compinit), and writing
+     *  into that is exactly what drops the tail of the chain — so wait another
+     *  round instead, and let its first output drive the release. */
+    const releaseOnDeadline = (): void => {
+      initialInputDeadline = null;
+      if (pendingInitialInput === null || disposed) return;
+      if (!sawOutput) {
+        initialInputDeadline = window.setTimeout(releaseOnDeadline, INITIAL_INPUT_MAX_WAIT_MS);
+        return;
+      }
+      flushInitialInput();
+    };
+
+    // Armed synchronously (not inside the async import below) so the pane is
+    // never briefly in a state where holding ⌘/Ctrl doesn't register.
+    unsubs.push(trackLinkModifier(container));
+
+    setStatus({ kind: 'loading' });
+
+    void (async () => {
+      const [{ Terminal }, { FitAddon }, { SearchAddon }, { Unicode11Addon }, { WebLinksAddon }] =
+        await Promise.all([
+          import('@xterm/xterm'),
+          import('@xterm/addon-fit'),
+          import('@xterm/addon-search'),
+          import('@xterm/addon-unicode11'),
+          import('@xterm/addon-web-links'),
+        ]);
+      if (disposed) return;
+
+      const term = new Terminal(buildTerminalOptions());
+      // App chords (Ctrl+Tab tab cycling, ⌘/Ctrl+W close, ⌘/Ctrl+K search, …)
+      // are capture-phase window listeners, so they run before this textarea's
+      // own keydown — but xterm ignores `defaultPrevented` and still encodes
+      // the key: Ctrl+Tab as a plain `\t` (zsh then lists every command),
+      // and on Linux Ctrl+W as ^W, Ctrl+[ as ESC, Ctrl+P as ^P… so a chord
+      // used to fire in the app *and* land in the shell. A keydown the app has
+      // already claimed is not the shell's; yield it. Everything else (plain
+      // Tab, Shift+Tab, a Mac's Ctrl+W, the peek-chat backtick, IME, keyup) is
+      // untouched. The prevented keydown also suppresses the browser's keypress.
+      term.attachCustomKeyEventHandler((event) => !event.defaultPrevented);
+      const fitAddon = new FitAddon();
+      term.open(container);
+      term.loadAddon(fitAddon);
+      term.loadAddon(new SearchAddon());
+      term.loadAddon(new Unicode11Addon());
+      // ⌘/Ctrl+click opens the URL outside the app; a plain click is left to
+      // the shell/TUI underneath (see terminal-links.ts).
+      term.loadAddon(new WebLinksAddon(openTerminalLink));
+      // Activate wide-char tables before any write, or CJK/emoji cells bake in
+      // at single width (Orca's pane-lifecycle ordering).
+      term.unicode.activeVersion = '11';
+      termRef.current = term;
+
+      const safeFit = (): void => {
+        try {
+          fitAddon.fit();
+        } catch {
+          /* container hidden or zero-sized; keep previous grid */
+        }
+      };
+
+      // Only forward grids the pty hasn't seen; identical re-fits (tab
+      // reveals, ResizeObserver double-fires) must not spam pty-resize.
+      let lastCols = 0;
+      let lastRows = 0;
+      const pushResizeIfChanged = (): void => {
+        if (term.cols === lastCols && term.rows === lastRows) return;
+        lastCols = term.cols;
+        lastRows = term.rows;
+        boundTransport.resize(term.cols, term.rows);
+      };
+
+      const spawn = async (): Promise<void> => {
+        setStatus({ kind: 'spawning' });
+        try {
+          await boundTransport.spawn({ cwd, cols: term.cols, rows: term.rows });
+          lastCols = term.cols;
+          lastRows = term.rows;
+          if (!disposed) {
+            setStatus({ kind: 'running' });
+            term.focus();
+            // Only the ceiling is armed here. The quiet timer starts on the
+            // shell's first output (see onData): a shell that hasn't printed
+            // anything yet is still sourcing rc files, not draining stdin, and
+            // 300ms of that silence is not a readiness signal — it's the window
+            // where written input gets dropped on the floor.
+            if (pendingInitialInput !== null && initialInputDeadline === null) {
+              initialInputDeadline = window.setTimeout(
+                releaseOnDeadline,
+                INITIAL_INPUT_MAX_WAIT_MS,
+              );
+            }
+          }
+        } catch (err) {
+          if (!disposed) {
+            setStatus({ kind: 'error', message: describeSpawnError(err) });
+          }
+        }
+      };
+      respawnRef.current = () => void spawn();
+
+      unsubs.push(
+        boundTransport.onData((bytes) => {
+          term.write(bytes);
+          // Bracketed-paste-on ⇒ the line editor owns the tty and is draining
+          // input: type setup right away. Otherwise wait out the quiet period —
+          // first output alone only means the shell started, and it drops
+          // anything past its input queue while it's still sourcing rc files.
+          sawOutput = true;
+          if (isLineEditorReady(bytes)) {
+            bracketedPasteOn = true;
+            flushInitialInput();
+          } else deferInitialInput();
+        }),
+      );
+      unsubs.push(
+        boundTransport.onExit((exitCode) => {
+          if (!disposed) setStatus({ kind: 'exited', exitCode });
+        }),
+      );
+      const inputDisposable = term.onData((data) => boundTransport.write(data));
+      unsubs.push(() => inputDisposable.dispose());
+
+      observer = new ResizeObserver(() => {
+        if (fitTimer !== null) window.clearTimeout(fitTimer);
+        fitTimer = window.setTimeout(() => {
+          fitTimer = null;
+          if (disposed) return;
+          safeFit();
+          pushResizeIfChanged();
+        }, RESIZE_DEBOUNCE_MS);
+      });
+      observer.observe(container);
+
+      // Initial fit deferred one frame so layout has settled, then spawn with
+      // the fitted grid.
+      initialFitRafId = requestAnimationFrame(() => {
+        initialFitRafId = null;
+        if (disposed) return;
+        safeFit();
+        void spawn();
+      });
+
+      // The bundled Nerd Font (terminal-fonts.css) is a webfont: it may still
+      // be loading when xterm first paints, so powerline/icon glyphs can flash
+      // as tofu and the canvas atlas caches those misses. Force the load, then
+      // re-measure (metrics are unchanged since the symbols font has no Latin
+      // glyphs, so this is a no-op resize) and refresh so cached glyphs repaint
+      // from the now-available font. Guarded by `disposed` — no cleanup needed.
+      const fontApi = typeof document !== 'undefined' ? document.fonts : undefined;
+      if (fontApi?.load) {
+        void fontApi
+          .load(`${term.options.fontSize ?? 14}px "Symbols Nerd Font Mono"`)
+          .catch(() => undefined)
+          .then(() => {
+            if (disposed) return;
+            safeFit();
+            pushResizeIfChanged();
+            try {
+              term.refresh(0, term.rows - 1);
+            } catch {
+              /* terminal torn down mid-refresh */
+            }
+          });
+      }
+    })().catch((err: unknown) => {
+      if (!disposed) {
+        setStatus({
+          kind: 'error',
+          message: err instanceof Error ? err.message : 'Failed to load terminal',
+        });
+      }
+    });
+
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      respawnRef.current = null;
+      // Disposal order (Orca): pending timers/rAF -> observer -> listeners ->
+      // transport -> terminal.
+      if (fitTimer !== null) window.clearTimeout(fitTimer);
+      clearInitialInputTimers();
+      if (chunkTimer !== null) window.clearTimeout(chunkTimer);
+      if (initialFitRafId !== null) cancelAnimationFrame(initialFitRafId);
+      observer?.disconnect();
+      observer = null;
+      for (const unsub of unsubs) {
+        try {
+          unsub();
+        } catch {
+          /* ignore */
+        }
+      }
+      unsubs.length = 0;
+      void boundTransport.kill().catch(() => undefined);
+      try {
+        termRef.current?.dispose();
+      } catch {
+        /* ignore */
+      }
+      termRef.current = null;
+    };
+    // Re-run (kill + re-spawn) only when the working directory really changes.
+  }, [cwd]);
+
+  const handleRestart = useCallback(() => {
+    respawnRef.current?.();
+  }, []);
+
+  return (
+    <div
+      className={`relative h-full w-full overflow-hidden ${className ?? ''}`}
+      style={{ backgroundColor: VICOA_TERMINAL_BACKGROUND }}
+    >
+      <div ref={containerRef} className="absolute inset-0 pl-2 pt-1 pb-0.5" />
+      {status.kind !== 'running' && (
+        <div
+          className="absolute inset-0 z-10 flex items-center justify-center"
+          style={{
+            backgroundColor:
+              status.kind === 'exited' || status.kind === 'error'
+                ? 'rgba(22, 28, 36, 0.85)'
+                : VICOA_TERMINAL_BACKGROUND,
+          }}
+        >
+          <div className="flex flex-col items-center gap-3 px-4 text-center">
+            {(status.kind === 'loading' || status.kind === 'spawning') && (
+              <p className="text-sm text-slate-400">
+                {status.kind === 'loading' ? 'Loading terminal…' : 'Starting shell…'}
+              </p>
+            )}
+            {status.kind === 'exited' && (
+              <p className="text-sm text-slate-400">
+                Process exited
+                {status.exitCode !== null ? ` (code ${status.exitCode})` : ''}
+              </p>
+            )}
+            {status.kind === 'error' && (
+              <p className="max-w-md break-words text-sm text-red-400">{status.message}</p>
+            )}
+            {(status.kind === 'exited' || status.kind === 'error') && (
+              <button
+                type="button"
+                onClick={handleRestart}
+                className="rounded-md border border-slate-600 px-3 py-1.5 text-sm text-slate-200 transition-colors hover:bg-slate-700/40"
+              >
+                Restart
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

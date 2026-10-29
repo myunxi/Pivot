@@ -1,0 +1,546 @@
+"""Tests for the agent-facing task API (servers/api/tasks.py).
+
+The human-facing equivalent is covered in backend/tests/test_tasks.py; this
+suite proves the same CRUD works under the agent RS256-JWT auth used by the
+CLI, including user scoping and the No-project default.
+"""
+
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from shared.database.models import User
+from shared.database.task_models import Project
+from shared.database.session import get_db
+from servers.api.auth import get_current_user_id
+from servers.api.tasks import task_router
+
+
+@pytest.fixture
+def test_user(test_db):
+    """The user seeded by the shared ``test_db`` fixture."""
+    return test_db.query(User).first()
+
+
+def _make_client(test_db, user_id):
+    """A TestClient for a minimal app mounting only the task router.
+
+    Avoids standing up the full unified server (MCP mount, websockets) — the
+    router plus overridden ``get_db``/``get_current_user_id`` is all these
+    endpoints touch.
+    """
+    app = FastAPI()
+    app.include_router(task_router, prefix="/api/v1")
+
+    def override_get_db():
+        yield test_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user_id] = lambda: str(user_id)
+    return TestClient(app)
+
+
+@pytest.fixture
+def client(test_db, test_user):
+    return _make_client(test_db, test_user.id)
+
+
+class TestTaskCrud:
+    def test_create_defaults_to_no_project(self, client):
+        resp = client.post("/api/v1/tasks", json={"title": "Write the CLI"})
+        assert resp.status_code == 201, resp.text
+        task = resp.json()
+        assert task["title"] == "Write the CLI"
+        assert task["status"] == "backlog"
+        assert task["priority"] == "none"
+        assert task["project_id"] is None  # unfiled: no hidden Inbox row
+
+    def test_create_with_fields(self, client):
+        resp = client.post(
+            "/api/v1/tasks",
+            json={
+                "title": "Urgent thing",
+                "description": "do it",
+                "status": "todo",
+                "priority": "urgent",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        task = resp.json()
+        assert task["status"] == "todo"
+        assert task["priority"] == "urgent"
+        assert task["description"] == "do it"
+
+    def test_list_and_status_filter(self, client):
+        client.post("/api/v1/tasks", json={"title": "A", "status": "todo"})
+        client.post("/api/v1/tasks", json={"title": "B", "status": "done"})
+
+        all_tasks = client.get("/api/v1/tasks").json()
+        assert {t["title"] for t in all_tasks} == {"A", "B"}
+
+        todo_only = client.get("/api/v1/tasks", params={"status": "todo"}).json()
+        assert [t["title"] for t in todo_only] == ["A"]
+
+    def test_list_priority_filter(self, client):
+        client.post("/api/v1/tasks", json={"title": "A", "priority": "high"})
+        client.post("/api/v1/tasks", json={"title": "B", "priority": "low"})
+
+        high_only = client.get("/api/v1/tasks", params={"priority": "high"}).json()
+        assert [t["title"] for t in high_only] == ["A"]
+
+    def test_list_status_and_priority_filter_combine(self, client):
+        client.post(
+            "/api/v1/tasks", json={"title": "A", "status": "todo", "priority": "high"}
+        )
+        client.post(
+            "/api/v1/tasks", json={"title": "B", "status": "todo", "priority": "low"}
+        )
+        client.post(
+            "/api/v1/tasks", json={"title": "C", "status": "done", "priority": "high"}
+        )
+
+        urgent_todo = client.get(
+            "/api/v1/tasks", params={"status": "todo", "priority": "high"}
+        ).json()
+        assert [t["title"] for t in urgent_todo] == ["A"]
+
+    def test_invalid_priority_rejected(self, client):
+        resp = client.get("/api/v1/tasks", params={"priority": "nonsense"})
+        assert resp.status_code == 422
+
+    def test_get_roundtrip(self, client):
+        created = client.post("/api/v1/tasks", json={"title": "Fetch me"}).json()
+        resp = client.get(f"/api/v1/tasks/{created['id']}")
+        assert resp.status_code == 200
+        assert resp.json()["id"] == created["id"]
+
+    def test_update_only_touches_sent_fields(self, client):
+        created = client.post(
+            "/api/v1/tasks", json={"title": "Before", "priority": "low"}
+        ).json()
+        resp = client.patch(
+            f"/api/v1/tasks/{created['id']}", json={"status": "in_progress"}
+        )
+        assert resp.status_code == 200, resp.text
+        updated = resp.json()
+        assert updated["status"] == "in_progress"
+        assert updated["title"] == "Before"  # untouched
+        assert updated["priority"] == "low"  # untouched
+
+    def test_delete_then_404(self, client):
+        created = client.post("/api/v1/tasks", json={"title": "Doomed"}).json()
+        assert client.delete(f"/api/v1/tasks/{created['id']}").status_code == 204
+        assert client.get(f"/api/v1/tasks/{created['id']}").status_code == 404
+
+    def test_invalid_status_rejected(self, client):
+        resp = client.post("/api/v1/tasks", json={"title": "Bad", "status": "nonsense"})
+        assert resp.status_code == 422
+
+    def test_unknown_project_is_404(self, client):
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"title": "Homeless", "project_id": str(uuid4())},
+        )
+        assert resp.status_code == 404
+
+
+class TestScoping:
+    def test_other_user_cannot_read_task(self, test_db, test_user):
+        owner_client = _make_client(test_db, test_user.id)
+        created = owner_client.post("/api/v1/tasks", json={"title": "Private"}).json()
+
+        stranger_client = _make_client(test_db, uuid4())
+        assert stranger_client.get(f"/api/v1/tasks/{created['id']}").status_code == 404
+        assert stranger_client.get("/api/v1/tasks").json() == []
+
+
+class TestIdentifierRefs:
+    """Every route takes "VIC-42" as readily as a UUID.
+
+    It matters most on this router: the CLI is an agent's only task entrypoint,
+    and the identifier is what both the agent and the human instructing it can
+    see. Asking either for a UUID asks for something neither has.
+    """
+
+    @pytest.fixture
+    def keyed(self, client, test_db, test_user):
+        """A task whose project got a key allocated on its first task. An
+        unfiled task has no identifier, so this one is filed in a project."""
+        project = Project(user_id=test_user.id, name="Vicoa")
+        test_db.add(project)
+        test_db.commit()
+        return client.post(
+            "/api/v1/tasks", json={"title": "Ship it", "project_id": str(project.id)}
+        ).json()
+
+    def test_get_by_identifier(self, client, keyed):
+        assert keyed["identifier"]
+        resp = client.get(f"/api/v1/tasks/{keyed['identifier']}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["id"] == keyed["id"]
+
+    def test_patch_by_identifier(self, client, keyed):
+        resp = client.patch(
+            f"/api/v1/tasks/{keyed['identifier']}", json={"status": "done"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "done"
+        assert resp.json()["id"] == keyed["id"]
+
+    def test_comment_by_identifier(self, client, keyed):
+        resp = client.post(
+            f"/api/v1/tasks/{keyed['identifier']}/comments", json={"body": "done"}
+        )
+        assert resp.status_code == 201, resp.text
+        assert [c["body"] for c in resp.json()["comments"]] == ["done"]
+
+    def test_unknown_identifier_is_404_not_422(self, client):
+        """The route takes whatever the user typed, so a typo has to land as
+        "not found" rather than as a validation error about UUIDs."""
+        assert client.get("/api/v1/tasks/NOPE-99").status_code == 404
+        assert client.get("/api/v1/tasks/not-a-ref-at-all").status_code == 404
+
+    def test_delete_by_identifier(self, client, keyed):
+        assert client.delete(f"/api/v1/tasks/{keyed['identifier']}").status_code == 204
+        assert client.get(f"/api/v1/tasks/{keyed['id']}").status_code == 404
+
+    def test_another_users_identifier_does_not_resolve(self, test_db, client, keyed):
+        stranger_client = _make_client(test_db, uuid4())
+        assert (
+            stranger_client.get(f"/api/v1/tasks/{keyed['identifier']}").status_code
+            == 404
+        )
+
+
+class TestComments:
+    """`vicoa task comment` — the agent's half of the task timeline."""
+
+    @pytest.fixture
+    def task(self, client):
+        return client.post("/api/v1/tasks", json={"title": "Ship it"}).json()
+
+    def test_post_and_read_back(self, client, task):
+        resp = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "ran the tests, all green"},
+        )
+        assert resp.status_code == 201, resp.text
+        assert [c["body"] for c in resp.json()["comments"]] == [
+            "ran the tests, all green"
+        ]
+
+        timeline = client.get(f"/api/v1/tasks/{task['id']}/timeline")
+        assert timeline.status_code == 200
+        assert len(timeline.json()["comments"]) == 1
+
+    def test_reply_threads_under_its_root(self, client, task):
+        root = client.post(
+            f"/api/v1/tasks/{task['id']}/comments", json={"body": "why?"}
+        ).json()["comments"][0]
+        replied = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "because", "parent_comment_id": root["id"]},
+        )
+        assert replied.status_code == 201, replied.text
+        comments = replied.json()["comments"]
+        assert [c["parent_comment_id"] for c in comments] == [None, root["id"]]
+
+    def test_unknown_parent_is_404(self, client, task):
+        resp = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "orphan", "parent_comment_id": str(uuid4())},
+        )
+        assert resp.status_code == 404
+
+    def test_comment_is_authored_by_the_calling_sessions_agent_profile(
+        self, test_db, test_user, client, task
+    ):
+        """The only path that ever produces `author_type='agent'`: the CLI
+        passes its `VICOA_AGENT_INSTANCE_ID`, and a session started from a
+        profile speaks in that profile's name."""
+        from shared.database.agent_profile_models import AgentProfile
+        from shared.database.models import AgentInstance, AgentType
+
+        profile = AgentProfile(
+            user_id=test_user.id, name="Reviewer", agent="claude", emoji="🤖"
+        )
+        test_db.add(profile)
+        test_db.flush()
+        instance = AgentInstance(
+            user_id=test_user.id,
+            agent_type_id=test_db.query(AgentType).first().id,
+            agent_profile_id=profile.id,
+        )
+        test_db.add(instance)
+        test_db.commit()
+
+        resp = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "reviewed", "agent_instance_id": str(instance.id)},
+        )
+        assert resp.status_code == 201, resp.text
+        author = resp.json()["comments"][0]["author"]
+        assert author["type"] == "agent"
+        assert author["name"] == "Reviewer"
+
+    def test_a_foreign_session_does_not_lend_its_agents_name(
+        self, test_db, test_user, client, task
+    ):
+        """Naming someone else's session must not borrow their agent's byline —
+        and must not fail the write either: losing the byline beats losing the
+        comment."""
+        resp = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "hello", "agent_instance_id": str(uuid4())},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["comments"][0]["author"]["type"] == "user"
+
+    def test_other_user_cannot_comment(self, test_db, test_user, task):
+        stranger_client = _make_client(test_db, uuid4())
+        resp = stranger_client.post(
+            f"/api/v1/tasks/{task['id']}/comments", json={"body": "sneaking in"}
+        )
+        assert resp.status_code == 404
+        assert (
+            stranger_client.get(f"/api/v1/tasks/{task['id']}/timeline").status_code
+            == 404
+        )
+
+
+class TestListFilters:
+    """`vicoa task ls --project none` and `--label`: the two selectors a
+    project_id/status/priority triple cannot express."""
+
+    @pytest.fixture
+    def project(self, test_db, test_user):
+        project = Project(user_id=test_user.id, name="Vicoa", key="VIC")
+        test_db.add(project)
+        test_db.commit()
+        return project
+
+    def test_unfiled_selects_no_project_tasks_only(self, client, project):
+        client.post("/api/v1/tasks", json={"title": "Unfiled"})
+        client.post(
+            "/api/v1/tasks", json={"title": "Filed", "project_id": str(project.id)}
+        )
+        unfiled = client.get("/api/v1/tasks", params={"unfiled": "true"}).json()
+        assert [t["title"] for t in unfiled] == ["Unfiled"]
+        # Without the flag NULL is not a filter — both come back.
+        assert len(client.get("/api/v1/tasks").json()) == 2
+
+    def test_unfiled_and_project_id_together_is_400(self, client, project):
+        resp = client.get(
+            "/api/v1/tasks", params={"unfiled": "true", "project_id": str(project.id)}
+        )
+        assert resp.status_code == 400
+
+    def test_label_filter_is_a_conjunction(self, client):
+        growth = client.post(
+            "/api/v1/task-labels", json={"name": "growth", "color": "#ff0000"}
+        ).json()
+        bug = client.post(
+            "/api/v1/task-labels", json={"name": "bug", "color": "#00ff00"}
+        ).json()
+        client.post("/api/v1/tasks", json={"title": "G", "label_ids": [growth["id"]]})
+        client.post(
+            "/api/v1/tasks",
+            json={"title": "GB", "label_ids": [growth["id"], bug["id"]]},
+        )
+        client.post("/api/v1/tasks", json={"title": "plain"})
+
+        only_growth = client.get(
+            "/api/v1/tasks", params={"label_id": growth["id"]}
+        ).json()
+        assert {t["title"] for t in only_growth} == {"G", "GB"}
+        both = client.get(
+            "/api/v1/tasks", params={"label_id": [growth["id"], bug["id"]]}
+        ).json()
+        assert [t["title"] for t in both] == ["GB"]
+
+    def test_tasks_carry_their_project_name(self, client, project):
+        filed = client.post(
+            "/api/v1/tasks", json={"title": "Filed", "project_id": str(project.id)}
+        ).json()
+        assert filed["project_name"] == "Vicoa"
+        assert filed["identifier"] == "VIC-1"
+        unfiled = client.post("/api/v1/tasks", json={"title": "Loose"}).json()
+        assert unfiled["project_name"] is None
+
+    def test_move_reassigns_identifier(self, client, test_db, test_user, project):
+        """What `vicoa task update --project` prints as `VIC-1 → VIC2-1`."""
+        other = Project(user_id=test_user.id, name="Second", key="VIC2")
+        test_db.add(other)
+        test_db.commit()
+        task = client.post(
+            "/api/v1/tasks", json={"title": "Mover", "project_id": str(project.id)}
+        ).json()
+        assert task["identifier"] == "VIC-1"
+        moved = client.patch(
+            f"/api/v1/tasks/{task['identifier']}", json={"project_id": str(other.id)}
+        ).json()
+        assert moved["identifier"] == "VIC2-1"
+        assert moved["project_name"] == "Second"
+        # Out to No project: the identifier goes away with the project.
+        loose = client.patch(f"/api/v1/tasks/{task['id']}", json={"project_id": None})
+        assert loose.json()["identifier"] is None
+        assert loose.json()["project_id"] is None
+
+
+class TestLabels:
+    """`vicoa label ls` / `label create`: the caller's own vocabulary."""
+
+    def test_create_and_list(self, client):
+        resp = client.post(
+            "/api/v1/task-labels", json={"name": "growth", "color": "3B82F6"}
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["color"] == "#3b82f6"  # normalised like the dashboard
+        assert resp.json()["team_id"] is None
+        assert [lbl["name"] for lbl in client.get("/api/v1/task-labels").json()] == [
+            "growth"
+        ]
+
+    def test_team_labels_are_refused_here(self, client):
+        resp = client.post(
+            "/api/v1/task-labels",
+            json={"name": "x", "color": "#000000", "team_id": str(uuid4())},
+        )
+        assert resp.status_code == 400
+
+    def test_other_users_labels_are_invisible(self, test_db, test_user, client):
+        client.post("/api/v1/task-labels", json={"name": "mine", "color": "#000000"})
+        stranger = _make_client(test_db, uuid4())
+        assert stranger.get("/api/v1/task-labels").json() == []
+
+
+class TestSessionProvenance:
+    """Writes made from inside a Vicoa session remember it: the task's
+    "Created in", a comment's and a change's "via"."""
+
+    @pytest.fixture
+    def instance(self, test_db, test_user):
+        from shared.database.models import AgentInstance, AgentType
+
+        instance = AgentInstance(
+            user_id=test_user.id,
+            agent_type_id=test_db.query(AgentType).first().id,
+            name="Triage run",
+        )
+        test_db.add(instance)
+        test_db.commit()
+        return instance
+
+    @pytest.fixture
+    def profiled_instance(self, test_db, test_user):
+        from shared.database.agent_profile_models import AgentProfile
+        from shared.database.models import AgentInstance, AgentType
+
+        profile = AgentProfile(
+            user_id=test_user.id, name="Reviewer", agent="claude", emoji="🤖"
+        )
+        test_db.add(profile)
+        test_db.flush()
+        instance = AgentInstance(
+            user_id=test_user.id,
+            agent_type_id=test_db.query(AgentType).first().id,
+            agent_profile_id=profile.id,
+        )
+        test_db.add(instance)
+        test_db.commit()
+        return instance
+
+    def test_create_records_the_calling_session(self, test_db, client, instance):
+        from shared.database.task_models import Task
+
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"title": "Found while fixing", "agent_instance_id": str(instance.id)},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["created_in_instance_id"] == str(instance.id)
+        task = test_db.get(Task, resp.json()["id"])
+        assert task.creator_type == "user"  # no profile: the user's own session
+
+        listed = client.get(
+            "/api/v1/tasks", params={"created_in_instance_id": str(instance.id)}
+        ).json()
+        assert [t["id"] for t in listed] == [resp.json()["id"]]
+
+    def test_create_from_a_profiled_session_is_agent_created(
+        self, test_db, client, profiled_instance
+    ):
+        from shared.database.task_models import Task
+
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"title": "t", "agent_instance_id": str(profiled_instance.id)},
+        )
+        assert test_db.get(Task, resp.json()["id"]).creator_type == "agent"
+
+    def test_a_foreign_session_is_ignored_not_refused(self, client):
+        resp = client.post(
+            "/api/v1/tasks", json={"title": "t", "agent_instance_id": str(uuid4())}
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["created_in_instance_id"] is None
+
+    def test_update_marks_its_changes_direct(self, client, instance):
+        task = client.post("/api/v1/tasks", json={"title": "t"}).json()
+        resp = client.patch(
+            f"/api/v1/tasks/{task['id']}",
+            json={"status": "blocked", "agent_instance_id": str(instance.id)},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "blocked"
+
+        timeline = client.get(f"/api/v1/tasks/{task['id']}/timeline").json()
+        row = next(r for r in timeline["activity"] if r["action"] == "status_changed")
+        assert row["details"] == {
+            "from": "backlog",
+            "to": "blocked",
+            "agent_instance_id": str(instance.id),
+            "direct": True,
+        }
+        assert [s["id"] for s in timeline["sessions"]] == [str(instance.id)]
+
+    def test_session_end_keeps_the_status_its_agent_chose(
+        self, test_db, client, instance
+    ):
+        """End to end: the agent marks its own linked task blocked and exits."""
+        from shared.database.enums import AgentStatus
+
+        task = client.post("/api/v1/tasks", json={"title": "t"}).json()
+        instance.task_id = UUID(task["id"])
+        test_db.commit()
+        assert client.get(f"/api/v1/tasks/{task['id']}").json()["status"] == (
+            "in_progress"
+        )
+
+        client.patch(
+            f"/api/v1/tasks/{task['id']}",
+            json={"status": "blocked", "agent_instance_id": str(instance.id)},
+        )
+        instance.status = AgentStatus.COMPLETED
+        test_db.commit()
+        assert client.get(f"/api/v1/tasks/{task['id']}").json()["status"] == "blocked"
+
+    def test_comment_records_the_session_without_a_profile(self, client, instance):
+        task = client.post("/api/v1/tasks", json={"title": "t"}).json()
+        resp = client.post(
+            f"/api/v1/tasks/{task['id']}/comments",
+            json={"body": "noted", "agent_instance_id": str(instance.id)},
+        )
+        assert resp.status_code == 201, resp.text
+        comment = resp.json()["comments"][0]
+        assert comment["author"]["type"] == "user"
+        assert comment["agent_instance_id"] == str(instance.id)
+        assert resp.json()["sessions"] == [
+            {
+                "id": str(instance.id),
+                "name": "Triage run",
+                "agent_type_name": "Claude Code",
+            }
+        ]

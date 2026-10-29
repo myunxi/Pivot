@@ -1,0 +1,417 @@
+'use client';
+
+import { useState } from 'react';
+import {
+  Check,
+  ChevronDown,
+  Flame,
+  Hammer,
+  Loader2,
+  NotebookPen,
+  PencilLine,
+  Shield,
+  SlidersHorizontal,
+  Zap,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { AgentTypeIcon } from '@/components/dashboard/agent-type-icon';
+
+/**
+ * Session config as three inline chips — Model (agent icon + model), Effort
+ * ("High", "Extra High", …) and Permission/Mode (icon + label) — replacing
+ * the old single gear dropdown. Each chip opens its own list; the current
+ * choice carries a tick, and picking one applies it and closes the list.
+ */
+
+export interface SessionConfigChipsProps {
+  disabled?: boolean;
+  /** Agent type for the model chip's icon (e.g. 'claude', 'codex'). */
+  agentTypeName?: string;
+  // Model (all agents)
+  models?: { id: string; label: string }[];
+  currentModel?: string | null;
+  pendingModel?: string | null;
+  onModelChange?: (id: string) => void;
+  // Effort: "Thinking" for claude, "Reasoning" for codex
+  efforts?: { id: string; label: string }[];
+  effortLabel?: string;
+  currentEffort?: string | null;
+  pendingEffort?: string | null;
+  onEffortChange?: (id: string) => void;
+  // Permission mode (claude / codex)
+  permissionModes?: { value: string; label: string }[];
+  currentPermissionMode?: string | null;
+  pendingPermissionMode?: string | null;
+  onPermissionModeChange?: (mode: string) => void;
+  // OpenCode mode
+  opencodeModes?: { value: string; label: string }[];
+  currentOpencodeMode?: string | null;
+  pendingOpencodeMode?: string | null;
+  onOpencodeMode?: (mode: string) => void;
+  /** Kept for API compatibility; chips always render single-column lists. */
+  singleColumnModels?: boolean;
+  /**
+   * Show what the session runs without offering to change it — someone
+   * else's session, shared with the viewer (collaboration §8.2). The chips
+   * render for any list that has entries, handler or not, and never open.
+   */
+  readOnly?: boolean;
+}
+
+/** Leading icon for a permission / opencode mode value. */
+export function ModeIcon({ value, className }: { value: string; className?: string }) {
+  const icons: Record<string, typeof Shield> = {
+    default: Shield,
+    plan: NotebookPen,
+    auto: Zap,
+    acceptEdits: PencilLine,
+    bypassPermissions: Flame,
+    build: Hammer,
+  };
+  const Icon = icons[value] ?? SlidersHorizontal;
+  return <Icon className={className ?? 'h-3.5 w-3.5'} />;
+}
+
+const CHIP_CLASS =
+  'flex h-6 max-w-44 min-w-0 shrink items-center gap-1.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-foreground/[0.06] dark:hover:bg-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50';
+const STATIC_CHIP_CLASS =
+  'flex h-6 max-w-44 min-w-0 shrink cursor-default items-center gap-1.5 rounded-lg px-2 text-xs text-muted-foreground';
+
+export function TickItem({
+  label,
+  sublabel,
+  isSelected,
+  isPending,
+  disabled,
+  onClick,
+  leading,
+}: {
+  label: string;
+  /** Muted trailing text — the raw model id when the label alone doesn't name it. */
+  sublabel?: string | null;
+  isSelected: boolean;
+  isPending: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  leading?: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={sublabel ? `${label} — ${sublabel}` : label}
+      disabled={disabled}
+      onClick={onClick}
+      className="group/item relative flex w-full cursor-pointer select-none items-center gap-2 rounded-sm border-0 px-3 py-1.5 text-xs outline-none transition-colors duration-100 hover:bg-foreground/[0.06] dark:hover:bg-foreground/10 hover:text-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      {leading}
+      <span className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden text-left">
+        {/* The name never shrinks — it's short and it's what you scan for.
+            The id takes whatever is left and ellipsizes; the full text is on
+            the button's title either way. */}
+        <span className="flex-shrink-0">{label}</span>
+        {sublabel && (
+          <span className="min-w-0 truncate text-[10px] text-muted-foreground/60">
+            {sublabel}
+          </span>
+        )}
+      </span>
+      <span className="flex w-4 flex-shrink-0 items-center justify-center">
+        {isPending ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : isSelected ? (
+          <Check className="h-3.5 w-3.5" />
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * The raw model id, when the label alone doesn't identify the model.
+ *
+ * Multi-provider agents (Pi, Oh My Pi, OpenCode, Kimi) advertise ids like
+ * `anthropic/claude-haiku-4-5-20251001` under a friendly name like "Claude
+ * Haiku 4.5" — and one machine routinely offers several builds behind the same
+ * name, so the label on its own can't be picked from. Cursor does the same
+ * with bracketed variants (`gpt-5.4[context=272k]`).
+ *
+ * Single-provider agents (Claude, Codex, Gemini) have ids you can already
+ * guess from the label, so showing them would be noise. The `/` and `[` test
+ * is exactly the "this agent fronts several providers or variants" signal.
+ */
+export function modelSublabel(model: { id: string; label: string }): string | null {
+  if (!model.id || model.id === model.label) return null;
+  if (!model.id.includes('/') && !model.id.includes('[')) return null;
+  return model.id;
+}
+
+/**
+ * Width for a model list, sized to its content when entries trail a raw id.
+ *
+ * A fixed width can't win here: `anthropic/claude-haiku-4-5-20251001` needs
+ * ~26rem, and the part that overflows first is the tail — which is exactly
+ * what distinguishes two builds sharing a display name, so truncating it
+ * defeats the point of showing the id at all. Sizing to content keeps a short
+ * list compact and gives a long one the room it needs, with a max so one
+ * pathological id can't stretch the menu across the window.
+ *
+ * Lists without ids keep the fixed `w-56` they have always had.
+ */
+export function modelListWidthClass(
+  models: readonly { id: string; label: string }[] | null | undefined,
+): string {
+  return models?.some((model) => modelSublabel(model))
+    ? 'w-auto min-w-56 max-w-[32rem]'
+    : 'w-56';
+}
+
+/**
+ * Width for a permission-mode list.
+ *
+ * `TickItem` never truncates its label (the mode name is what you scan for),
+ * so a fixed `w-52` overflowed the moment a label grew past ~24 characters —
+ * Antigravity's "Read only (auto-deny writes & commands)" is the case that
+ * hit it. Sized to content with the old width as the floor, so the short
+ * Claude/Codex lists look exactly as before.
+ */
+export const PERMISSION_LIST_WIDTH_CLASS = 'w-auto min-w-52 max-w-[26rem]';
+
+/** One chip + its dropdown list. */
+export function ChipDropdown({
+  chip,
+  title,
+  disabled,
+  children,
+  contentClassName,
+  side = 'top',
+  readOnly = false,
+}: {
+  chip: React.ReactNode;
+  title: string;
+  disabled?: boolean;
+  children: (close: () => void) => React.ReactNode;
+  contentClassName?: string;
+  /** Which side to prefer; Radix flips on collision. New-session opens up
+   *  (chips sit at the screen bottom); the automation panel opens down. */
+  side?: 'top' | 'bottom';
+  /** A plain label: no list, no chevron. */
+  readOnly?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  if (readOnly) {
+    return (
+      <span title={`${title} (set by the session's owner)`} className={STATIC_CHIP_CLASS}>
+        {chip}
+      </span>
+    );
+  }
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <button type="button" title={title} disabled={disabled} className={CHIP_CLASS}>
+          {chip}
+          <ChevronDown className="h-3 w-3 flex-shrink-0 opacity-60" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        side={side}
+        className={cn(
+          // Lifted border so the list clearly separates from the input surface.
+          'max-h-72 overflow-y-auto rounded-xl border border-foreground/15 p-1 font-mono shadow-xl custom-scrollbar',
+          contentClassName,
+        )}
+      >
+        {/* Dimmed panel label, pinned while the list scrolls. Left padding
+            matches the items' px-3 so it lines up with their content column. */}
+        <div className="sticky top-0 z-10 bg-menu px-3 pb-1.5 pt-1 text-xs text-muted-foreground/60">
+          {title}
+        </div>
+        {children(() => setOpen(false))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+export function SessionConfigChips({
+  disabled,
+  agentTypeName,
+  models,
+  currentModel,
+  pendingModel,
+  onModelChange,
+  efforts,
+  effortLabel = 'Thinking',
+  currentEffort,
+  pendingEffort,
+  onEffortChange,
+  permissionModes,
+  currentPermissionMode,
+  pendingPermissionMode,
+  onPermissionModeChange,
+  opencodeModes,
+  currentOpencodeMode,
+  pendingOpencodeMode,
+  onOpencodeMode,
+  readOnly = false,
+}: SessionConfigChipsProps) {
+  const hasModels = models && models.length > 0 && (readOnly || !!onModelChange);
+  const hasEfforts = efforts && efforts.length > 0 && (readOnly || !!onEffortChange);
+  const hasPermissions =
+    permissionModes && permissionModes.length > 0 && (readOnly || !!onPermissionModeChange);
+  const hasOpencode = opencodeModes && opencodeModes.length > 0 && (readOnly || !!onOpencodeMode);
+
+  if (!hasModels && !hasEfforts && !hasPermissions && !hasOpencode) return null;
+
+  const modelLabel =
+    (pendingModel && models?.find((m) => m.id === pendingModel)?.label) ??
+    models?.find((m) => m.id === currentModel)?.label ??
+    currentModel ??
+    'Model';
+  const effortChipLabel =
+    (pendingEffort && efforts?.find((e) => e.id === pendingEffort)?.label) ??
+    efforts?.find((e) => e.id === currentEffort)?.label ??
+    effortLabel;
+  const permissionValue = pendingPermissionMode ?? currentPermissionMode ?? 'default';
+  const permissionLabel =
+    permissionModes?.find((m) => m.value === permissionValue)?.label ?? 'Permission';
+  const opencodeValue = pendingOpencodeMode ?? currentOpencodeMode ?? 'build';
+  const opencodeLabel =
+    opencodeModes?.find((m) => m.value === opencodeValue)?.label ?? 'Mode';
+
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      {hasModels && (
+        <ChipDropdown
+          title="Model"
+          disabled={disabled}
+          readOnly={readOnly}
+          contentClassName={modelListWidthClass(models)}
+          chip={
+            <>
+              {pendingModel ? (
+                <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />
+              ) : (
+                <AgentTypeIcon agentTypeName={agentTypeName ?? null} size={12} whiteForOpenAI />
+              )}
+              <span className="min-w-0 truncate">{modelLabel}</span>
+            </>
+          }
+        >
+          {(close) =>
+            models!.map((m) => (
+              <TickItem
+                key={m.id}
+                label={m.label}
+                sublabel={modelSublabel(m)}
+                isSelected={m.id === currentModel}
+                isPending={m.id === pendingModel}
+                disabled={!!pendingModel}
+                onClick={() => { onModelChange!(m.id); close(); }}
+              />
+            ))
+          }
+        </ChipDropdown>
+      )}
+
+      {hasEfforts && (
+        <ChipDropdown
+          title={effortLabel}
+          disabled={disabled}
+          readOnly={readOnly}
+          contentClassName="w-44"
+          chip={
+            <>
+              {pendingEffort && <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />}
+              <span className="min-w-0 truncate">{effortChipLabel}</span>
+            </>
+          }
+        >
+          {(close) =>
+            efforts!.map((e) => (
+              <TickItem
+                key={e.id}
+                label={e.label}
+                isSelected={e.id === currentEffort}
+                isPending={e.id === pendingEffort}
+                disabled={!!pendingEffort}
+                onClick={() => { onEffortChange!(e.id); close(); }}
+              />
+            ))
+          }
+        </ChipDropdown>
+      )}
+
+      {hasPermissions && (
+        <ChipDropdown
+          title="Mode"
+          disabled={disabled}
+          readOnly={readOnly}
+          contentClassName={PERMISSION_LIST_WIDTH_CLASS}
+          chip={
+            <>
+              {pendingPermissionMode ? (
+                <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />
+              ) : (
+                <ModeIcon value={permissionValue} className="h-3.5 w-3.5 flex-shrink-0" />
+              )}
+              <span className="min-w-0 truncate">{permissionLabel}</span>
+            </>
+          }
+        >
+          {(close) =>
+            permissionModes!.map((mode) => (
+              <TickItem
+                key={mode.value}
+                label={mode.label}
+                leading={<ModeIcon value={mode.value} className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />}
+                isSelected={mode.value === currentPermissionMode}
+                isPending={mode.value === pendingPermissionMode}
+                disabled={!!pendingPermissionMode}
+                onClick={() => { onPermissionModeChange!(mode.value); close(); }}
+              />
+            ))
+          }
+        </ChipDropdown>
+      )}
+
+      {hasOpencode && (
+        <ChipDropdown
+          title="Mode"
+          disabled={disabled}
+          readOnly={readOnly}
+          contentClassName="w-44"
+          chip={
+            <>
+              {pendingOpencodeMode ? (
+                <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />
+              ) : (
+                <ModeIcon value={opencodeValue} className="h-3.5 w-3.5 flex-shrink-0" />
+              )}
+              <span className="min-w-0 truncate">{opencodeLabel}</span>
+            </>
+          }
+        >
+          {(close) =>
+            opencodeModes!.map((mode) => (
+              <TickItem
+                key={mode.value}
+                label={mode.label}
+                leading={<ModeIcon value={mode.value} className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />}
+                isSelected={mode.value === currentOpencodeMode}
+                isPending={mode.value === pendingOpencodeMode}
+                disabled={!!pendingOpencodeMode}
+                onClick={() => { onOpencodeMode!(mode.value); close(); }}
+              />
+            ))
+          }
+        </ChipDropdown>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,148 @@
+"""Notification utilities for sending push, email, and SMS notifications."""
+
+import asyncio
+import logging
+from uuid import UUID
+from sqlalchemy.orm import Session
+
+from shared.database import User, AgentInstance
+from shared.websocket.connection_manager import connection_manager
+from .fcm_service import fcm_service
+from .twilio_service import twilio_service
+
+logger = logging.getLogger(__name__)
+
+
+async def send_message_notifications(
+    db: Session,
+    instance_id: UUID,
+    content: str,
+    requires_user_input: bool,
+    send_email: bool | None = None,
+    send_sms: bool | None = None,
+    send_push: bool | None = None,
+) -> None:
+    """Send notifications for a message (either step or question).
+
+    Args:
+        db: Database session
+        instance_id: Agent instance ID
+        content: Message content
+        requires_user_input: Whether this message requires user input
+        send_email: Override email notification preference
+        send_sms: Override SMS notification preference
+        send_push: Override push notification preference
+    """
+
+    # Get instance and user. Off the event loop: this runs right after the
+    # ingest commit on the hottest path in the server, and the rows were just
+    # expired by that commit, so every attribute below is a fresh SELECT.
+    def _load() -> tuple[AgentInstance, User, str] | None:
+        instance = (
+            db.query(AgentInstance).filter(AgentInstance.id == instance_id).first()
+        )
+        if not instance:
+            logger.warning(f"Instance {instance_id} not found for notifications")
+            return None
+        user = db.query(User).filter(User.id == instance.user_id).first()
+        if not user:
+            logger.warning(f"User {instance.user_id} not found for notifications")
+            return None
+        agent_name = instance.agent_type.name if instance.agent_type else "Agent"
+        # Touch the columns read below so no lazy load fires on the loop.
+        _ = (
+            instance.id,
+            instance.user_id,
+            user.push_notifications_enabled,
+            user.email_notifications_enabled,
+            user.sms_notifications_enabled,
+        )
+        return instance, user, agent_name
+
+    loaded = await asyncio.to_thread(_load)
+    if loaded is None:
+        return
+    instance, user, agent_name = loaded
+
+    # Determine notification preferences based on message type
+    if requires_user_input:
+        # For questions: respect user preferences
+        should_send_push = (
+            send_push if send_push is not None else user.push_notifications_enabled
+        )
+        should_send_email = (
+            send_email if send_email is not None else user.email_notifications_enabled
+        )
+        should_send_sms = (
+            send_sms if send_sms is not None else user.sms_notifications_enabled
+        )
+    else:
+        # For steps: notifications default to False unless explicitly enabled
+        should_send_push = send_push if send_push is not None else False
+        should_send_email = send_email if send_email is not None else False
+        should_send_sms = send_sms if send_sms is not None else False
+
+    # Suppress the phone push while the user is actively looking at the desktop
+    # app. The desktop client reports window foreground over its /ws connection
+    # (opt-in; on by default) and this process — which owns those connections —
+    # reads it here. This mirrors the desktop banner's "only when unfocused"
+    # policy for the phone, and intentionally wins over an explicit send_push
+    # override: if you're looking at the desktop, don't buzz the phone. Email and
+    # SMS are unaffected.
+    if should_send_push and connection_manager.is_desktop_foreground(
+        str(instance.user_id)
+    ):
+        logger.info(
+            f"Suppressing phone push for user {instance.user_id}: desktop foreground"
+        )
+        should_send_push = False
+
+    # Send push notification if enabled
+    if should_send_push:
+        try:
+            if requires_user_input:
+                result = await fcm_service.send_question_notification(
+                    db=db,
+                    user_id=instance.user_id,
+                    instance_id=str(instance.id),
+                    agent_name=agent_name,
+                    question_text=content,
+                )
+                logger.info(f"Push notification result for question: {result}")
+            else:
+                result = await fcm_service.send_step_notification(
+                    db=db,
+                    user_id=instance.user_id,
+                    instance_id=str(instance.id),
+                    agent_name=agent_name,
+                    step_description=content,
+                )
+                logger.info(f"Push notification result for step: {result}")
+        except Exception as e:
+            logger.error(f"Failed to send push notification: {e}")
+
+    # Send Twilio notifications if enabled
+    if should_send_email or should_send_sms:
+        try:
+            if requires_user_input:
+                await twilio_service.send_question_notification(
+                    db=db,
+                    user_id=instance.user_id,
+                    instance_id=str(instance.id),
+                    agent_name=agent_name,
+                    question_text=content,
+                    send_email=should_send_email,
+                    send_sms=should_send_sms,
+                )
+            else:
+                await twilio_service.send_step_notification(
+                    db=db,
+                    user_id=instance.user_id,
+                    instance_id=str(instance.id),
+                    agent_name=agent_name,
+                    step_description=content,
+                    send_email=should_send_email,
+                    send_sms=should_send_sms,
+                )
+        except Exception as e:
+            logger.error(f"Failed to send Twilio notification: {e}")

@@ -1,0 +1,810 @@
+import { getRpcClient, RpcError } from '@/lib/ws-client';
+import type { PrInfo } from '@/components/dashboard/pr-status';
+
+export type RpcCode =
+  | 'path_not_found'
+  | 'permission_denied'
+  | 'outside_project'
+  | 'too_large'
+  | 'not_a_repo'
+  | 'no_handler'
+  | 'not_a_directory'
+  | 'not_a_file'
+  | 'write_failed'
+  | 'conflict'
+  | 'target_disconnected'
+  | 'timeout'
+  | 'not_connected'
+  | 'rpc_failed'
+  | 'unknown_app'
+  | 'app_not_found'
+  | 'launch_failed';
+
+export interface FileEntry {
+  name: string;
+  type: 'dir' | 'file';
+  size?: number;
+}
+
+export interface ListFilesResult {
+  entries: FileEntry[];
+}
+
+export interface ReadFileResult {
+  content: string;
+  encoding: 'utf-8' | 'base64';
+  is_binary: boolean;
+  size: number;
+  truncated: boolean;
+  /** sha256 of the on-disk bytes; the base for edit conflict detection. `null`
+   * for binary/truncated files (not editable), and absent from daemons that
+   * predate editing — both leave the file read-only. */
+  content_hash?: string | null;
+  /** Set for a video (the daemon tags them instead of sniffing them binary). */
+  mime_type?: string;
+  /** Where a `<video>` streams that video from, signed for this one file:
+   * this machine's local server on desktop, the cloud relay otherwise. Absent
+   * when the route can't serve one (an older server). Already absolute here. */
+  stream_url?: string;
+}
+
+/** `stat-file` — a cheap freshness probe (no contents) the editor polls for
+ * open tabs to notice the file changed on disk under an active edit. */
+export interface StatFileResult {
+  size: number;
+  mtime: number;
+  content_hash: string | null;
+}
+
+/** `write-file` success. `content_hash` is the new base for the next save. */
+export interface WriteFileResult {
+  size: number;
+  mtime: number;
+  content_hash: string;
+}
+
+/** `write-file` refused because the on-disk hash no longer matches the base the
+ * caller held — a concurrent write (e.g. the agent) would be clobbered. The
+ * caller reloads or retries with `force`. */
+export interface WriteConflict {
+  conflict: true;
+  content_hash: string | null;
+}
+
+export function isWriteConflict(
+  r: WriteFileResult | WriteConflict,
+): r is WriteConflict {
+  return (r as WriteConflict).conflict === true;
+}
+
+export type GitStatusEntryStatus = 'M' | 'A' | 'D' | 'R' | 'C' | 'T' | 'U' | '??';
+
+export interface GitStatusEntry {
+  path: string;
+  old_path?: string;
+  status: GitStatusEntryStatus | string;
+  additions: number;
+  deletions: number;
+  content_hash: string | null;
+  /** A `160000` gitlink — the parent repo pins this path to one submodule
+   * commit, so its plain diff is only ever "Subproject commit a..b". The panel
+   * expands these by re-running `git-status`/`git-diff` with `cwd` set to the
+   * submodule directory. Absent on daemons that predate the flag, which is
+   * exactly what hides the toolbar toggle there. */
+  is_submodule?: boolean;
+}
+
+export interface GitStatusResult {
+  branch: string | null;
+  ahead: number;
+  behind: number;
+  upstream?: string;
+  detached_head?: boolean;
+  staged: GitStatusEntry[];
+  unstaged: GitStatusEntry[];
+  untracked: GitStatusEntry[];
+}
+
+export type DiffLineKind = 'add' | 'remove' | 'context';
+
+export interface DiffLine {
+  type: DiffLineKind;
+  content: string;
+}
+
+export interface DiffHunk {
+  header: string;
+  old_start: number;
+  old_count: number;
+  new_start: number;
+  new_count: number;
+  lines: DiffLine[];
+}
+
+export interface GitDiffResult {
+  path: string;
+  hunks: DiffHunk[];
+  is_binary: boolean;
+  truncated: boolean;
+  size?: number;
+  old_size?: number;
+  new_size?: number;
+}
+
+export async function rpcListFiles(
+  machineId: string,
+  cwd: string,
+  path: string,
+): Promise<ListFilesResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'list-files', { cwd, path });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as ListFilesResult;
+}
+
+/** Whole-project `@`-mention index. Folders (trailing `/`) first, then files. */
+export interface ScanFilesResult {
+  files: string[];
+  file_count: number;
+  hash: string;
+  truncated: boolean;
+  /** Unix seconds. Wall-clock, not the daemon's TTL clock. */
+  scanned_at: number;
+}
+
+/** Reply when the caller's `known_hash` still matches — no payload resent. */
+export interface ScanFilesUnchanged {
+  unchanged: true;
+  hash: string;
+}
+
+/**
+ * Fetch the live project index for `@` mentions.
+ *
+ * Distinct from `rpcListFiles`, which lists ONE directory level for the Files
+ * tab tree and filters through `git check-ignore`; this walks the whole
+ * project through `pathspec` so it also works outside a git repo.
+ *
+ * Requires a daemon advertising the `file-index` capability — older ones fail
+ * with `no_handler`, which `lib/file-mentions-store.ts` turns into a DB
+ * fallback. Pass `knownHash` to get `{unchanged: true}` instead of the payload
+ * when nothing on disk has moved.
+ */
+export async function rpcScanFiles(
+  machineId: string,
+  cwd: string,
+  knownHash?: string,
+): Promise<ScanFilesResult | ScanFilesUnchanged> {
+  const params: Record<string, unknown> = { cwd };
+  if (knownHash) params.known_hash = knownHash;
+  const result = await getRpcClient(machineId).callRpc(machineId, 'scan-files', params);
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as ScanFilesResult | ScanFilesUnchanged;
+}
+
+/** One slash command or skill from the live daemon index. */
+export interface ScanCommandItem {
+  name: string;
+  description: string;
+  kind: 'command' | 'skill';
+  /** Composer text to insert on selection when it differs from /name. */
+  insert?: string;
+}
+
+/** Live slash command/skill index for a machine + agent. */
+export interface ScanCommandsResult {
+  commands: ScanCommandItem[];
+  command_count: number;
+  hash: string;
+  /** Unix seconds, wall-clock. */
+  scanned_at: number;
+}
+
+/** Reply when the caller's `known_hash` still matches — no payload resent. */
+export interface ScanCommandsUnchanged {
+  unchanged: true;
+  hash: string;
+}
+
+/**
+ * Fetch the live slash command/skill set for `agentType` on a machine.
+ *
+ * Counterpart to `rpcScanFiles` for the `/` menu: reads the machine's current
+ * ~/.claude, ~/.codex and ~/.agents dirs instead of the copy the CLI synced
+ * into the DB at session start. `cwd` scopes project-local sources and may be
+ * omitted (globals are still scanned).
+ *
+ * Requires a daemon advertising the `command-index` capability — older ones
+ * fail with `no_handler`, which `lib/slash-commands-store.ts` turns into a DB
+ * fallback.
+ */
+export async function rpcScanCommands(
+  machineId: string,
+  agentType: string,
+  cwd?: string | null,
+  knownHash?: string,
+): Promise<ScanCommandsResult | ScanCommandsUnchanged> {
+  const params: Record<string, unknown> = { agent_type: agentType };
+  if (cwd) params.cwd = cwd;
+  if (knownHash) params.known_hash = knownHash;
+  const result = await getRpcClient(machineId).callRpc(machineId, 'scan-commands', params);
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as ScanCommandsResult | ScanCommandsUnchanged;
+}
+
+export async function rpcReadFile(
+  machineId: string,
+  cwd: string,
+  path: string,
+): Promise<ReadFileResult> {
+  const client = getRpcClient(machineId);
+  const result = await client.callRpc(machineId, 'read-file', { cwd, path });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  // The server sends a path; it resolves against the socket that carried it.
+  if (typeof result.stream_url === 'string') {
+    result.stream_url = client.httpUrl(result.stream_url);
+  }
+  return result as unknown as ReadFileResult;
+}
+
+/** Poll an open file's on-disk signature without transferring its contents. */
+export async function rpcStatFile(
+  machineId: string,
+  cwd: string,
+  path: string,
+): Promise<StatFileResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'stat-file', { cwd, path });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as StatFileResult;
+}
+
+/**
+ * Write `content` (UTF-8) back to `path`, atomically on the daemon side.
+ *
+ * `baseHash` is the hash the caller held when it opened the file; the daemon
+ * rejects the write with a {@link WriteConflict} (rather than throwing) if the
+ * file changed underneath — pass `force` to overwrite anyway. Hard failures
+ * (permission, offline, …) still throw {@link RpcError}.
+ */
+export async function rpcWriteFile(
+  machineId: string,
+  cwd: string,
+  path: string,
+  content: string,
+  baseHash: string | null,
+  force = false,
+): Promise<WriteFileResult | WriteConflict> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'write-file', {
+    cwd,
+    path,
+    content,
+    base_hash: baseHash,
+    force,
+  });
+  if (result.error === 'conflict') {
+    return { conflict: true, content_hash: (result.content_hash as string | null) ?? null };
+  }
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as WriteFileResult;
+}
+
+/**
+ * `git-show-file` — the baseline ("original") side of the editable diff view.
+ * Returns a `read-file`-shaped payload for `path` at git `ref` (default HEAD;
+ * `''` reads the index/staged blob). A path absent at the ref (a new/untracked
+ * file) comes back as `{ not_in_ref: true }` so the client shows an empty
+ * original. Requires a daemon advertising the `git-base` capability — older
+ * ones fail `no_handler`, and the diff view falls back to the read-only inline
+ * diff.
+ */
+export interface GitShowFileResult {
+  content?: string;
+  encoding?: 'utf-8' | 'base64';
+  is_binary?: boolean;
+  size?: number;
+  truncated?: boolean;
+  content_hash?: string | null;
+  /** The path doesn't exist at the ref — treat the original as empty. */
+  not_in_ref?: boolean;
+}
+
+export async function rpcGitShowFile(
+  machineId: string,
+  cwd: string,
+  path: string,
+  ref = 'HEAD',
+): Promise<GitShowFileResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-show-file', {
+    cwd,
+    path,
+    ref,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as GitShowFileResult;
+}
+
+export async function rpcGitStatus(
+  machineId: string,
+  cwd: string,
+): Promise<GitStatusResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-status', { cwd });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as GitStatusResult;
+}
+
+export async function rpcGitDiff(
+  machineId: string,
+  cwd: string,
+  path: string,
+  staged: boolean,
+  ignoreWhitespace: boolean,
+): Promise<GitDiffResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-diff', {
+    cwd,
+    path,
+    staged,
+    ignore_whitespace: ignoreWhitespace,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as GitDiffResult;
+}
+
+// ── Staging + commit (git-stage / git-unstage / git-commit) ───────────────────
+// All three need a daemon advertising the `git-write` capability — older ones
+// fail `no_handler`, which the UI surfaces as "update the daemon".
+
+/** `git-stage`/`git-unstage` result: `ok`, or the daemon's own git error text
+ * (e.g. an index lock held by a running agent) for the UI to show verbatim. */
+export type GitWriteOutcome = { ok: true } | { ok: false; message: string };
+
+async function callGitWrite(
+  machineId: string,
+  method: 'git-stage' | 'git-unstage',
+  cwd: string,
+  paths: string[],
+): Promise<GitWriteOutcome> {
+  const result = await getRpcClient(machineId).callRpc(machineId, method, { cwd, paths });
+  if (result.error === 'stage_failed' || result.error === 'unstage_failed') {
+    return { ok: false, message: (result.message as string | undefined) || String(result.error) };
+  }
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return { ok: true };
+}
+
+export function rpcGitStage(
+  machineId: string,
+  cwd: string,
+  paths: string[],
+): Promise<GitWriteOutcome> {
+  return callGitWrite(machineId, 'git-stage', cwd, paths);
+}
+
+export function rpcGitUnstage(
+  machineId: string,
+  cwd: string,
+  paths: string[],
+): Promise<GitWriteOutcome> {
+  return callGitWrite(machineId, 'git-unstage', cwd, paths);
+}
+
+/**
+ * `git-commit` — commit whatever is staged. A git-level failure (nothing
+ * staged, missing user identity, a hook rejecting) comes back as
+ * `{ok: false}` with git's own message rather than throwing, so the commit box
+ * can show something actionable. Transport-level failures still throw.
+ */
+export async function rpcGitCommit(
+  machineId: string,
+  cwd: string,
+  message: string,
+): Promise<GitWriteOutcome & { commit_id?: string }> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-commit', {
+    cwd,
+    message,
+  });
+  if (result.error === 'commit_failed') {
+    return { ok: false, message: (result.message as string | undefined) || 'commit failed' };
+  }
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return { ok: true, commit_id: result.commit_id as string | undefined };
+}
+
+/** One git worktree of a repo (`git-worktree-list`). `managed` means the daemon
+ * created it under `~/vicoa/workspaces/` — only those are removable.
+ * `display_path` is the home-collapsed `~/…` form a session registers as its
+ * `project`; `prunable` is git's verdict that the folder is gone while the
+ * registration lingers. Both are absent from an older daemon. */
+export interface WorktreeInfo {
+  path: string;
+  display_path?: string;
+  branch: string;
+  head: string;
+  managed: boolean;
+  prunable?: boolean;
+}
+
+export async function rpcGitWorktreeList(
+  machineId: string,
+  cwd: string,
+): Promise<WorktreeInfo[]> {
+  return (await rpcGitWorktreeListWithMain(machineId, cwd)).worktrees;
+}
+
+/** A repo's linked worktrees plus where its main checkout is. `cwd` may be
+ * any folder of the repo — a subfolder or a linked worktree — which is what
+ * makes `mainPath` useful: it resolves whatever path the caller holds to the
+ * repo root. `mainPath` is null on a daemon that predates the field. */
+export interface WorktreeListing {
+  mainPath: string | null;
+  mainDisplayPath: string | null;
+  worktrees: WorktreeInfo[];
+}
+
+export async function rpcGitWorktreeListWithMain(
+  machineId: string,
+  cwd: string,
+): Promise<WorktreeListing> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-worktree-list', { cwd });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return {
+    mainPath: typeof result.main_path === 'string' ? result.main_path : null,
+    mainDisplayPath:
+      typeof result.main_display_path === 'string' ? result.main_display_path : null,
+    worktrees: (result.worktrees as WorktreeInfo[]) ?? [],
+  };
+}
+
+/** The daemon's verdict on a user-typed name for a new worktree
+ * (`git-worktree-check-name`). `suggestion` is the first free `name-2`,
+ * `name-3`, … when the name is taken, for a one-click fix. */
+export type WorktreeNameCheck =
+  | { available: true }
+  | { available: false; reason: 'invalid_name' | 'name_taken'; suggestion?: string };
+
+export async function rpcGitWorktreeCheckName(
+  machineId: string,
+  cwd: string,
+  name: string,
+): Promise<WorktreeNameCheck> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-worktree-check-name', {
+    cwd,
+    name,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  if (result.available === true) return { available: true };
+  return {
+    available: false,
+    reason: result.reason === 'name_taken' ? 'name_taken' : 'invalid_name',
+    suggestion: typeof result.suggestion === 'string' ? result.suggestion : undefined,
+  };
+}
+
+/**
+ * `git-worktree-remove`. `cwd` must be the repo's MAIN checkout, not the
+ * worktree: a worktree whose folder is already gone can't host the git call
+ * (the daemon answers `not_a_repo`), whereas from the main checkout git also
+ * clears a stale registration, and a path that is gone on both counts comes
+ * back `{ok, already_removed}` rather than as an error.
+ */
+export async function rpcGitWorktreeRemove(
+  machineId: string,
+  cwd: string,
+  worktreePath: string,
+  force: boolean,
+): Promise<void> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-worktree-remove', {
+    cwd,
+    worktree_path: worktreePath,
+    force,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+}
+
+/** Trust a repo's committed `vicoa.json` so its worktree setup/teardown commands
+ *  may run on this machine (persisted daemon-side, per repo path). `directory` is
+ *  the SOURCE repo the setup came from, not the worktree. */
+export async function rpcWorktreeTrustGrant(
+  machineId: string,
+  directory: string,
+): Promise<void> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'worktree-trust-grant', {
+    directory,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+}
+
+/** Ask the daemon to run a worktree's setup commands now (background thread on
+ *  the machine; progress readable via `rpcWorktreeSetupStatus`). The daemon runs
+ *  setup itself on a trusted repo's spawn — this is for after the user confirms
+ *  an untrusted one (grant trust first). `directory` is the SOURCE repo (trust key
+ *  + config source); `worktreePath` is where the commands run. A run already in
+ *  flight for the worktree is not duplicated (`already_running`). */
+export async function rpcWorktreeRunSetup(
+  machineId: string,
+  worktreePath: string,
+  directory: string,
+): Promise<void> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'worktree-run-setup', {
+    worktree_path: worktreePath,
+    directory,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+}
+
+export type WorktreeSetupStepStatus = 'pending' | 'running' | 'ok' | 'failed';
+
+export interface WorktreeSetupStep {
+  index: number;
+  command: string;
+  status: WorktreeSetupStepStatus;
+  exit_code: number | null;
+  duration_ms: number | null;
+  timed_out: boolean;
+  aborted: boolean;
+}
+
+/** The daemon's record of a worktree's setup run. `status: 'none'` when it has
+ *  never run one there (no config, untrusted and never confirmed, or an old
+ *  daemon that left the run to the client's terminal). */
+export type WorktreeSetupStatus =
+  | { status: 'none' }
+  | {
+      status: 'running' | 'succeeded' | 'failed';
+      worktree_path: string;
+      source_repo: string;
+      started_at: number;
+      finished_at: number | null;
+      total: number;
+      commands: WorktreeSetupStep[];
+      /** Last ~16 KiB of the combined log, starting on a whole line. */
+      output_tail: string;
+      log_path: string;
+    };
+
+export async function rpcWorktreeSetupStatus(
+  machineId: string,
+  worktreePath: string,
+): Promise<WorktreeSetupStatus> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'worktree-setup-status', {
+    worktree_path: worktreePath,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as WorktreeSetupStatus;
+}
+
+// ── Commit history (git-log / git-commit-files / git-commit-diff) ─────────────
+
+export interface CommitRef {
+  name: string;
+  kind: 'head' | 'branch' | 'remote' | 'tag';
+}
+
+export interface CommitEntry {
+  id: string;
+  short_id: string;
+  parent_ids: string[];
+  subject: string;
+  body: string;
+  author_name: string;
+  author_email: string;
+  timestamp: number;
+  refs: CommitRef[];
+}
+
+export interface RefRevision {
+  name: string;
+  revision: string;
+}
+
+export interface GitLogResult {
+  commits: CommitEntry[];
+  has_more: boolean;
+  current_ref?: RefRevision;
+  upstream_ref?: RefRevision;
+}
+
+export interface CommitFileEntry {
+  path: string;
+  old_path?: string;
+  status: GitStatusEntryStatus | string;
+  additions: number;
+  deletions: number;
+}
+
+export interface CommitFilesResult {
+  files: CommitFileEntry[];
+  stats: { files: number; insertions: number; deletions: number };
+}
+
+export async function rpcGitLog(
+  machineId: string,
+  cwd: string,
+  limit: number,
+): Promise<GitLogResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-log', { cwd, limit });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as GitLogResult;
+}
+
+export async function rpcGitCommitFiles(
+  machineId: string,
+  cwd: string,
+  commitId: string,
+): Promise<CommitFilesResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-commit-files', {
+    cwd,
+    commit_id: commitId,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as CommitFilesResult;
+}
+
+export async function rpcGitCommitDiff(
+  machineId: string,
+  cwd: string,
+  commitId: string,
+  path: string,
+): Promise<GitDiffResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'git-commit-diff', {
+    cwd,
+    commit_id: commitId,
+    path,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as GitDiffResult;
+}
+
+// ── Open in… (list-open-apps / open-path) ────────────────────────────────────
+// Opening a path in Finder/VS Code/Ghostty has to happen on the machine that
+// holds the files, so both sides are daemon RPCs. Needs a daemon advertising
+// the `open-in` capability — older ones fail `no_handler`, which is why
+// `open-in-menu.tsx` hides the whole menu instead of showing an empty one.
+
+/** What an app does with the path it is handed. `default` is the OS's own
+ * handler for the file's type (Excel for `.xlsx`) — one row, resolved by the
+ * machine, never a catalog of viewers. */
+export type OpenAppKind = 'default' | 'file-manager' | 'editor' | 'terminal';
+
+/** One app the daemon's machine can actually open a path with. */
+export interface OpenApp {
+  id: string;
+  label: string;
+  kind: OpenAppKind;
+  /** `dir` apps (terminals) always get a directory — a file resolves to its
+   * parent. `file` apps (the default app) take files only: the daemon refuses
+   * a directory, so the client hides them when the target is one. */
+  target: 'path' | 'dir' | 'file';
+}
+
+export interface ListOpenAppsResult {
+  /** The daemon's `sys.platform` — `darwin` | `win32` | `linux` | … */
+  platform: string;
+  apps: OpenApp[];
+}
+
+/** Apps installed on `machineId` that can open a project path. */
+export async function rpcListOpenApps(machineId: string): Promise<ListOpenAppsResult> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'list-open-apps', {});
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+  return result as unknown as ListOpenAppsResult;
+}
+
+/**
+ * Open `path` (project-relative; `''` is the project root) in `app` on
+ * `machineId`. `app` is an id from {@link rpcListOpenApps} — the daemon maps it
+ * to a fixed argv and refuses anything else, so no command ever travels over
+ * the wire.
+ */
+export async function rpcOpenPath(
+  machineId: string,
+  cwd: string,
+  path: string,
+  app: string,
+): Promise<void> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'open-path', {
+    cwd,
+    path,
+    app,
+  });
+  if (typeof result.error === 'string') {
+    throw new RpcError(result.error);
+  }
+}
+
+/**
+ * Pull-request state for every branch of the repo containing `cwd`, keyed by
+ * branch name. Resolves to an empty map on any failure — no `gh`, not signed
+ * in, no GitHub remote, an outage — because each of those means "this repo has
+ * no PR decoration to show", never "raise an error at the user".
+ *
+ * One call covers a whole repository. Callers join it locally against branches
+ * they already know rather than asking per branch; see the daemon's
+ * `github_ops` docstring for why that batching is load-bearing.
+ */
+export async function rpcGithubPrList(
+  machineId: string,
+  cwd: string,
+): Promise<Record<string, PrInfo>> {
+  const result = await getRpcClient(machineId).callRpc(machineId, 'github-pr-list', {
+    cwd,
+  });
+  if (typeof result.error === 'string') return {};
+  return (result.prs as Record<string, PrInfo>) ?? {};
+}
+
+/** How long a repo's PR map is reused before a later focus refetches it. */
+const PR_CACHE_TTL_MS = 60_000;
+
+const prCache = new Map<string, { at: number; value: Promise<Record<string, PrInfo>> }>();
+
+/**
+ * {@link rpcGithubPrList} behind a short shared TTL, keyed by machine + repo.
+ *
+ * Two surfaces call this: the sidebar (once per project, on window focus) and
+ * the session detail header (on open). Without a cache between them, opening a
+ * session would re-fetch a repo the sidebar just fetched, and a user
+ * alt-tabbing repeatedly would fire one network call per focus event. Unlike
+ * the local-git RPCs beside it, this one spends a GitHub API request from a
+ * per-account quota shared with the `gh` calls the agent itself makes, so it
+ * must not be driven directly by an event the user can repeat at will.
+ */
+export function rpcGithubPrListCached(
+  machineId: string,
+  cwd: string,
+): Promise<Record<string, PrInfo>> {
+  // machineId is a UUID, so a colon cannot straddle the two halves of the key.
+  const key = `${machineId}:${cwd}`;
+  const hit = prCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < PR_CACHE_TTL_MS) return hit.value;
+
+  const value = rpcGithubPrList(machineId, cwd).catch(() => {
+    // Never cache a rejection: a transient disconnect would otherwise suppress
+    // every retry for the rest of the TTL.
+    prCache.delete(key);
+    return {} as Record<string, PrInfo>;
+  });
+  prCache.set(key, { at: now, value });
+  return value;
+}

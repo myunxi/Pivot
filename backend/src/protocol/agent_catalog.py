@@ -1,0 +1,500 @@
+"""Static agent catalog served by `GET /api/v1/agent-catalog`.
+
+Hand-curated per `plans/new-session-model-selection.md` §3.1, §4.1, §5.1.
+Module-level constants are computed once at import; the daemon imports the
+derived `PERMISSION_MODES` / `THINKING_EFFORTS` / `REASONING_EFFORTS` sets for
+structural validation so no snapshot has to ship with each daemon release.
+
+Canonical copy. Lives under the top-level `protocol/` package — the wire-format
+contract shared between backend (serves it) and CLI/web/mobile (consume it) —
+rather than `shared/`, which is reserved for backend↔servers DB and infra.
+The backend still imports `from shared.agent_catalog import ...` for
+back-compat; `shared/agent_catalog.py` is a re-export shim around this module.
+
+Fallback mirrors in `vicoa-web/lib/agent-catalog.ts` and
+`vicoa-app/lib/backend/agent_catalog.dart` must move with it. Refresh process
+and upstream slug discovery: `docs/agents/agent-catalog.md`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+from protocol.acp_catalog import ACP_CATALOG
+
+
+AGENT_CATALOG: dict[str, Any] = {
+    "version": "2026-09-26-1",
+    "min_cli_version": "1.20.0",
+    "min_client_version": "0.42.0",
+    "agents": [
+        {
+            "id": "claude",
+            "label": "Claude Code",
+            # `supports_steer`: the wrapper can deliver a queued message into
+            # the *running* turn (the queue bar's Steer button). Claude Code's
+            # streaming stdin picks a mid-turn user message up at the next
+            # tool boundary (verified on claude 2.1.261); Codex has a native
+            # `turn/steer` RPC; pi/omp have a `steer` RPC. Omitted (false) for
+            # ACP agents — the protocol is one prompt turn at a time — and
+            # OpenCode, which only queues.
+            "supports_steer": True,
+            "models": [
+                # Per-model `thinking_efforts` / `permission_modes` arrays list
+                # ONLY the opt-in ids this model adds beyond the common set.
+                # Omit the field entirely when the model has no opt-ins. No
+                # Claude model needs one: every permission mode is common, so a
+                # new model gets `auto` without a per-model field.
+                # Opus 4.7+ default to xhigh thinking — they're the only models
+                # with the depth-of-reasoning to justify the agent-level `high`
+                # baseline being bumped. `default_thinking_effort` overrides
+                # `is_default` when this model is selected.
+                # Fable 5, Opus 5 and Opus 5.5 are natively 1M-context (max ==
+                # default), so they have no `[1m]` variant — see
+                # ``integrations/headless/usage.py`` (_CLAUDE_CONTEXT_WINDOWS).
+                # Fable 5 is premium-priced and thinking-always-on, so it is not
+                # the picker default. `xhigh` is the recommended coding/agentic
+                # effort tier for Fable 5 and Opus 5.
+                {
+                    "id": "claude-fable-5",
+                    "label": "Fable 5",
+                    "default_thinking_effort": "xhigh",
+                },
+                # Opus 5.5 is the newest Opus (Claude Code 2.1.282+, where the
+                # bare `opus` alias resolves to it). No `default_thinking_effort`
+                # on purpose: Claude Code's own default for it is `medium`, so it
+                # takes the agent-level `high` rather than Opus 5's `xhigh`.
+                # The model rejects disabled thinking, so the `off` tier is
+                # coerced back on by the CLI rather than erroring.
+                {"id": "claude-opus-5-5", "label": "Opus 5.5"},
+                {
+                    "id": "claude-opus-5",
+                    "label": "Opus 5",
+                    "default_thinking_effort": "xhigh",
+                },
+                {
+                    "id": "claude-opus-4-8",
+                    "label": "Opus 4.8",
+                    "default_thinking_effort": "xhigh",
+                },
+                {
+                    "id": "claude-opus-4-8[1m]",
+                    "label": "Opus 4.8 1M",
+                    "default_thinking_effort": "xhigh",
+                },
+                {
+                    "id": "claude-opus-4-7",
+                    "label": "Opus 4.7",
+                    "default_thinking_effort": "xhigh",
+                },
+                {
+                    "id": "claude-opus-4-7[1m]",
+                    "label": "Opus 4.7 1M",
+                    "default_thinking_effort": "xhigh",
+                },
+                {"id": "claude-opus-4-6", "label": "Opus 4.6"},
+                {"id": "claude-opus-4-6[1m]", "label": "Opus 4.6 1M"},
+                {
+                    "id": "claude-sonnet-5",
+                    "label": "Sonnet 5",
+                    "is_default": True,
+                },
+                {"id": "claude-sonnet-5[1m]", "label": "Sonnet 5 1M"},
+                {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
+                {"id": "claude-sonnet-4-6[1m]", "label": "Sonnet 4.6 1M"},
+                {"id": "claude-haiku-4-5", "label": "Haiku 4.5"},
+            ],
+            # Agent-level lists carry labels + display order for ALL known
+            # values. Entries tagged `opt_in: True` are model-specific
+            # capabilities — they only render when the active model's
+            # per-model array explicitly opts them in. Entries without the
+            # flag are "common" and shown for every model unless excluded.
+            "thinking_efforts": [
+                {"id": "max", "label": "Max"},
+                {"id": "xhigh", "label": "Extra High"},
+                {"id": "high", "label": "High", "is_default": True},
+                {"id": "medium", "label": "Medium"},
+                {"id": "low", "label": "Low"},
+                {"id": "off", "label": "Off"},
+            ],
+            # `auto` is the default for every model, mirroring Claude Code,
+            # which starts new sessions in auto mode. It is deliberately NOT
+            # `opt_in`: an opt-in entry only shows for a model the client's
+            # catalog names, and mobile/desktop gear sheets read the catalog
+            # baked into the build, so every new model lost `auto` there until
+            # an app release (Opus 5.5). Claude Code 2.1.282 starts Opus 4.6 and
+            # Haiku 4.5 in auto without error, and a live switch the CLI refuses
+            # is recovered by the daemon (the permission_mode control in
+            # ``integrations/headless/claude_code.py``).
+            "permission_modes": [
+                {"id": "default", "label": "Default"},
+                {"id": "auto", "label": "Auto mode", "is_default": True},
+                {"id": "acceptEdits", "label": "Accept Edits"},
+                {"id": "plan", "label": "Plan"},
+                {"id": "bypassPermissions", "label": "Skip permissions (Yolo)"},
+            ],
+        },
+        {
+            "id": "codex",
+            "label": "Codex",
+            "supports_steer": True,
+            # Refresh per docs/agents/agent-catalog.md. Do NOT source from
+            # ~/.codex/models_cache.json — that file is per-user / per-account
+            # (filtered by entitlements) and doesn't reflect the canonical
+            # list of slugs users could pick. Use the codex CLI's own
+            # documentation or release notes instead.
+            #
+            # gpt-5.6 ships as three variants in codex-cli 0.144.5 (Sol =
+            # latest frontier, Terra = balanced everyday, Luna = fast/cheap);
+            # all three share the low/medium/high/xhigh effort axis below.
+            # gpt-5.5 stays the default; 5.6 is opt-in until it's proven.
+            "models": [
+                {"id": "gpt-5.5", "label": "GPT-5.5", "is_default": True},
+                {"id": "gpt-5.6-sol", "label": "GPT-5.6-Sol"},
+                {"id": "gpt-5.6-terra", "label": "GPT-5.6-Terra"},
+                {"id": "gpt-5.6-luna", "label": "GPT-5.6-Luna"},
+                {"id": "gpt-5.4", "label": "GPT-5.4"},
+                {"id": "gpt-5.4-mini", "label": "GPT-5.4-Mini"},
+            ],
+            # Subset of codex-rs ReasoningEffort (openai_models.rs:45) — full
+            # enum is none/minimal/low/medium/high/xhigh. We expose the four
+            # useful for coding; `none` and `minimal` are skipped (analogous
+            # to skipping Claude's `off` from the default picker).
+            "reasoning_efforts": [
+                {"id": "low", "label": "Low"},
+                {"id": "medium", "label": "Medium", "is_default": True},
+                {"id": "high", "label": "High"},
+                {"id": "xhigh", "label": "Extra High"},
+            ],
+            # Vicoa's permission_mode is a BUNDLED abstraction — each slug
+            # collapses 2-3 codex settings (approval_policy + sandbox_mode +
+            # collaboration_mode). See integrations/headless/codex/permission_translate.py
+            # for the canonical spawn-time mapping; the Rust bridge mirrors
+            # the same bundle when dispatching mid-session changes.
+            "permission_modes": [
+                {"id": "default", "label": "Default", "is_default": True},
+                {"id": "bypassPermissions", "label": "Full Access"},
+            ],
+        },
+        {
+            "id": "opencode",
+            "label": "OpenCode",
+            # OpenCode is a multi-provider proxy whose available models depend
+            # on each user's local opencode config. `default` keeps the user's
+            # own configured model (no --model at spawn); the rest is a starter
+            # set. The real per-config list is reported live to the mid-session
+            # gear (the wrapper PATCHes available_models from session/new).
+            "models": [
+                {"id": "default", "label": "Default", "is_default": True},
+                {
+                    "id": "opencode/big-pickle",
+                    "label": "OpenCode Zen - big-pickle",
+                },
+            ],
+            "modes": [
+                {"id": "build", "label": "Build", "is_default": True},
+                {"id": "plan", "label": "Plan"},
+            ],
+        },
+        # ---------------------------------------------------------------
+        # Pi family (integrations/headless/pi_family/) — native RPC, not ACP.
+        # `omp` is a fork of `pi`; one wrapper drives both from a spec table.
+        #
+        # Both proxy many providers whose real model list is per-machine
+        # configuration, so — like OpenCode — `default` is the only static
+        # entry and the true list is reported live from `get_available_models`
+        # into the mid-session gear.
+        #
+        # Thinking levels: the CLIs also accept `minimal` (both) and `auto`
+        # (omp only). They are deliberately NOT listed here — adding them would
+        # widen the shared THINKING_EFFORTS enum for every agent. The spec
+        # table accepts them if something passes one, and anything outside a
+        # CLI's own set is dropped at the launch boundary.
+        # ---------------------------------------------------------------
+        {
+            "id": "omp",
+            "label": "Oh My Pi",
+            "supports_steer": True,
+            "models": [{"id": "default", "label": "Default", "is_default": True}],
+            "thinking_efforts": [
+                {"id": "max", "label": "Max"},
+                {"id": "xhigh", "label": "Extra High"},
+                {"id": "high", "label": "High"},
+                {"id": "medium", "label": "Medium", "is_default": True},
+                {"id": "low", "label": "Low"},
+                {"id": "off", "label": "Off"},
+            ],
+            # -> `--approval-mode`, verified against `omp --help` (18.1.10).
+            # Reusing Vicoa's existing slugs rather than minting ask/write/full
+            # keeps the clients' shared mode picker and the daemon's
+            # PERMISSION_MODES validation unchanged; the spec table owns the
+            # translation, as codex/permission_translate.py does for Codex.
+            # Note `default` means always-ask here (the safe default for a new
+            # integration), not "inherit the user's omp config".
+            "permission_modes": [
+                {"id": "default", "label": "Always Ask", "is_default": True},
+                {"id": "acceptEdits", "label": "Write Approval"},
+                {"id": "bypassPermissions", "label": "Skip permissions (Yolo)"},
+            ],
+        },
+        {
+            "id": "pi",
+            "label": "Pi",
+            "supports_steer": True,
+            "models": [{"id": "default", "label": "Default", "is_default": True}],
+            "thinking_efforts": [
+                {"id": "max", "label": "Max"},
+                {"id": "xhigh", "label": "Extra High"},
+                {"id": "high", "label": "High"},
+                {"id": "medium", "label": "Medium", "is_default": True},
+                {"id": "low", "label": "Low"},
+                {"id": "off", "label": "Off"},
+            ],
+            # Pi has no approval-mode flag at all, so no permission_modes and
+            # no mode picker.
+        },
+        # ---------------------------------------------------------------
+        # Antigravity CLI (integrations/headless/antigravity/) — Google's
+        # `agy`, driven over its stream-json stdio (`--input-format
+        # stream-json`, agy >= 1.1.15). Neither ACP nor an SDK.
+        #
+        # Models: the 2026-09-16 `agy models` list. Every id already encodes
+        # its reasoning effort ("gemini-3.8-flash-high"), a mismatched
+        # `--effort` is a hard startup error and Claude ids reject the flag,
+        # so there is deliberately no `thinking_efforts` here — the effort
+        # picker IS the model picker. `default` keeps agy's own configured
+        # model. The wrapper PATCHes the live list into `available_models`
+        # at session start (cached per machine), so this is a starter set.
+        #
+        # Permissions: headless agy cannot prompt, so nothing here yields an
+        # Approve button. `default` (agy `request-review`) auto-allows
+        # workspace reads and auto-DENIES writes and commands; `acceptEdits`
+        # (`--mode accept-edits`) also allows workspace writes; `plan`
+        # (`--mode plan`) writes a plan artifact first, then behaves like
+        # `default`; `bypassPermissions` is `--dangerously-skip-permissions`.
+        # A denial ends the turn and the wrapper posts one notice explaining
+        # how to unblock it (permissions.allow rules or a new session).
+        # `supports_steer` is unset: the CLI must not be written to mid-turn.
+        # ---------------------------------------------------------------
+        {
+            "id": "antigravity",
+            "label": "Antigravity",
+            "models": [
+                {"id": "default", "label": "Default", "is_default": True},
+                {"id": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash (High)"},
+                {"id": "gemini-3.8-flash-medium", "label": "Gemini 3.8 Flash (Medium)"},
+                {"id": "gemini-3.8-flash-low", "label": "Gemini 3.8 Flash (Low)"},
+                {"id": "gemini-3.7-flash-high", "label": "Gemini 3.7 Flash (High)"},
+                {"id": "gemini-3.7-flash-medium", "label": "Gemini 3.7 Flash (Medium)"},
+                {"id": "gemini-3.7-flash-low", "label": "Gemini 3.7 Flash (Low)"},
+                {"id": "gemini-3.6-flash-high", "label": "Gemini 3.6 Flash (High)"},
+                {"id": "gemini-3.6-flash-medium", "label": "Gemini 3.6 Flash (Medium)"},
+                {"id": "gemini-3.6-flash-low", "label": "Gemini 3.6 Flash (Low)"},
+                {"id": "gemini-3.1-pro-high", "label": "Gemini 3.1 Pro (High)"},
+                {"id": "gemini-3.1-pro-low", "label": "Gemini 3.1 Pro (Low)"},
+                {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6 (Thinking)"},
+                {
+                    "id": "claude-opus-4-6-thinking",
+                    "label": "Claude Opus 4.6 (Thinking)",
+                },
+                {"id": "gpt-oss-120b-medium", "label": "GPT-OSS 120B (Medium)"},
+            ],
+            "permission_modes": [
+                {
+                    "id": "default",
+                    "label": "Read only (auto-deny writes & commands)",
+                    "is_default": True,
+                },
+                {"id": "acceptEdits", "label": "Write approval (auto-deny commands)"},
+                {"id": "plan", "label": "Plan"},
+                {"id": "bypassPermissions", "label": "Skip permissions (Yolo)"},
+            ],
+        },
+        # ---------------------------------------------------------------
+        # Generic ACP agents (integrations/headless/generic_acp.py).
+        #
+        # IMPORTANT: for ACP agents the AUTHORITATIVE source of available
+        # modes and models is each session's `session/new` response
+        # (`modes.availableModes` / `models.availableModels` / `configOptions`),
+        # which the wrapper captures live (acp_base: `available_modes`,
+        # `session_config_options`). The values below are only spawn-time
+        # hints / fallback labels — they're account-gated and version-specific
+        # upstream, so don't treat them as exhaustive. permission_modes are
+        # validated against the live availableModes at spawn (unknown ids are
+        # skipped). Verified June 2026 against each CLI's ACP server:
+        #   • cursor  → agent / plan / ask (real ACP mode ids)
+        #   • gemini  → default / autoEdit (camelCase!) / yolo / plan(when enabled)
+        #   • kimi    → only `default` over ACP (plan/yolo are shell/slash-only)
+        #   • copilot → ACP mode ids undocumented (closed source); omit until
+        #               sourced from the live session
+        #
+        # `models` here is a STATIC default set shown in the new-session model
+        # picker. It's account/version-specific upstream, so it can't be
+        # exhaustive (a given install may advertise others — those appear in
+        # the mid-session gear, which is sourced live from session/new).
+        # `auto`/`default` is offered so the user can always defer to the
+        # agent's own default. Proper fix for showing an install's REAL models
+        # at new-session is per-machine discovery (TODO).
+        # ---------------------------------------------------------------
+        {
+            "id": "cursor",
+            "label": "Cursor",
+            "models": [
+                {"id": "auto", "label": "Default", "is_default": True},
+                {"id": "composer-2.5", "label": "Composer 2.5"},
+            ],
+            "permission_modes": [
+                {"id": "agent", "label": "Agent", "is_default": True},
+                {"id": "plan", "label": "Plan"},
+                {"id": "ask", "label": "Ask"},
+            ],
+        },
+        {
+            "id": "gemini",
+            "label": "Gemini",
+            "models": [
+                {"id": "auto", "label": "Default", "is_default": True},
+                {"id": "gemini-3.1-flash-lite", "label": "Gemini 3.1 Flash Lite"},
+                {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+                {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+            ],
+            "permission_modes": [
+                {"id": "default", "label": "Default", "is_default": True},
+                # Wire id is camelCase `autoEdit` (ApprovalMode enum), not
+                # the `auto_edit` CLI-flag spelling.
+                {"id": "autoEdit", "label": "Auto Edit"},
+                {"id": "plan", "label": "Plan"},
+                {"id": "yolo", "label": "Skip permissions (Yolo)"},
+            ],
+        },
+        {
+            "id": "copilot",
+            "label": "Copilot",
+            # Copilot's default install offers these; richer model access is
+            # subscription-gated. Like the others this is a starter set — an
+            # install's real options show in the live gear, and the catalog id
+            # is resolved against the agent's live values at spawn.
+            "models": [
+                {"id": "default", "label": "Default", "is_default": True},
+                {"id": "gpt-5-mini", "label": "GPT-5 mini"},
+                {"id": "claude-haiku-4.5", "label": "Claude Haiku 4.5"},
+            ],
+            # ACP mode ids are undocumented (Copilot CLI is closed source) and
+            # likely a permission config-option rather than a mode list —
+            # source modes from the live session instead.
+        },
+        {
+            "id": "kimi",
+            "label": "Kimi",
+            # `auto` (default) skips --model so Kimi uses its config
+            # default_model; the rest are the common namespaced aliases. Like
+            # the others this is a default set — an install's real aliases
+            # (account/provider-specific) show in the live gear.
+            "models": [
+                {"id": "auto", "label": "Default", "is_default": True},
+                {"id": "moonshot-ai/kimi-k2.5", "label": "Kimi K2.5"},
+                {"id": "moonshot-ai/kimi-k2.6", "label": "Kimi K2.6"},
+                {"id": "moonshot-ai/kimi-k2.7-code", "label": "Kimi K2.7 Code"},
+            ],
+            # Kimi advertises only a single `default` ACP session mode
+            # (plan/yolo are shell/slash-mode only) — no mode picker.
+        },
+        {
+            "id": "hermes",
+            "label": "Hermes",
+            "models": [
+                {"id": "default", "label": "Provider default", "is_default": True},
+            ],
+        },
+    ],
+    # Agents a user can add with one click (Settings → Providers, or
+    # `vicoa provider add`). Not in `agents`: the daemon does not know them
+    # until they are installed into the machine's config, and they carry no
+    # model/mode lists — an ACP agent reports those at session/new.
+    "acp_catalog": ACP_CATALOG,
+}
+
+
+def _build_enum_indices(
+    catalog: dict[str, Any],
+) -> tuple[
+    dict[str, set[str]],
+    set[str],
+    set[str],
+]:
+    """Derive validation sets from the catalog so daemon and endpoint share truth."""
+    permission_modes: dict[str, set[str]] = {}
+    thinking_efforts: set[str] = set()
+    reasoning_efforts: set[str] = set()
+    for agent in catalog["agents"]:
+        agent_id = agent["id"]
+        pm = {entry["id"] for entry in agent.get("permission_modes") or []}
+        if pm:
+            permission_modes[agent_id] = pm
+        for entry in agent.get("thinking_efforts") or []:
+            thinking_efforts.add(entry["id"])
+        for model in agent.get("models") or []:
+            for effort in model.get("thinking_efforts") or []:
+                thinking_efforts.add(effort)
+        for entry in agent.get("reasoning_efforts") or []:
+            reasoning_efforts.add(entry["id"])
+    return permission_modes, thinking_efforts, reasoning_efforts
+
+
+PERMISSION_MODES, THINKING_EFFORTS, REASONING_EFFORTS = _build_enum_indices(
+    AGENT_CATALOG
+)
+
+#: The exact key set of ``apps/web/lib/agent-catalog.ts::SessionConfig``. Three
+#: tables store this shape verbatim — ``agent_instances.session_config``,
+#: ``automations.session_config`` and ``agent_profiles.config`` — which is what
+#: lets the web client run ``reconcileAgainst(config, catalog)`` over any of them
+#: and get stale-model repair for free. Keep in sync with that interface.
+SESSION_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "agent",
+        "model",
+        "thinking_effort",
+        "reasoning_effort",
+        "permission_mode",
+        "opencode_mode",
+    }
+)
+
+
+def known_agent_ids() -> set[str]:
+    """Catalog agent ids ('claude', 'codex', 'opencode', …)."""
+    return {agent["id"] for agent in AGENT_CATALOG["agents"]}
+
+
+def normalize_session_config(config: Any, agent: str) -> dict[str, Any]:
+    """Coerce arbitrary input to a clean ``SessionConfig`` dict.
+
+    Drops unknown keys and null/empty values, and forces ``agent`` to the caller's
+    authoritative value — for ``agent_profiles`` that is the indexed column, which
+    must never disagree with the copy inside the JSON blob.
+
+    Deliberately does NOT validate model/effort ids against the catalog: those go
+    stale on their own (a provider retires a model), and the clients already repair
+    them silently via ``reconcileAgainst``. Rejecting them here would turn a
+    self-healing case into a 422 on a profile the user cannot fix.
+    """
+    out: dict[str, Any] = {}
+    if isinstance(config, dict):
+        for key, value in config.items():
+            if (
+                key in SESSION_CONFIG_KEYS
+                and key != "agent"
+                and value not in (None, "")
+            ):
+                out[key] = value
+    out["agent"] = agent
+    return out
+
+
+# JSON-encoded once at import: stable bytes for ETag computation and direct
+# Response body without per-request `json.dumps`.
+AGENT_CATALOG_JSON: str = json.dumps(AGENT_CATALOG, sort_keys=True)
+AGENT_CATALOG_ETAG: str = hashlib.sha256(AGENT_CATALOG_JSON.encode("utf-8")).hexdigest()

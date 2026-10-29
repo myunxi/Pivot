@@ -1,0 +1,685 @@
+---
+title: CLI Commands
+description: Full reference for the Vicoa CLI — start, list, inspect, and stop agent sessions, read transcripts, and manage your task backlog and scheduled automations from the terminal.
+---
+
+# CLI Commands
+
+The `vicoa` command is the terminal front door to your Vicoa account. From any machine you can:
+
+- **Start, resume, and stop** agent sessions (Claude Code, Codex, OpenCode, and more).
+- **List and inspect** every session you own — across machines, including finished ones — and read their message transcripts.
+- **Manage your task backlog** — create, update, move, label, and close tasks without leaving the terminal; list your projects and labels.
+- **Share a session** — mint a public link to a transcript (for a pull request, a teammate) and revoke it again.
+- **Schedule automations** — saved prompts that fire an agent session on a recurring schedule.
+
+A machine can have two kinds of session running at once:
+
+- **Daemon sessions** — headless agents the `vicoa daemon` started in response to a remote "New Session" request from the mobile app or web dashboard.
+- **TUI sessions** — interactive agents you started yourself in a terminal with `vicoa`, `vicoa codex`, or `vicoa opencode`.
+
+**Keep the CLI current.** Install or upgrade with npm, and check your version before using the newer `session`, `task`, and `automation` commands:
+
+```bash
+npm i -g @vicoa/cli@latest
+vicoa --version
+```
+
+`vicoa ls` and `vicoa stop` require CLI **1.4.1 or newer**.
+
+## Authentication
+
+Every command that talks to the backend needs an API key. The management commands (`session`, `task`, `automation`, and `ls`) resolve it in this order and **never open a browser** — so a script is never left hanging on a login prompt:
+
+1. `--api-key <key>` flag
+2. `VICOA_API_KEY` environment variable
+3. the stored credential in `~/.vicoa/credentials.json` (its `write_key` field)
+
+If you don't have a stored key yet, sign in once:
+
+```bash
+vicoa --auth      # first-time sign-in (opens a browser)
+vicoa --reauth    # refresh an expired or invalid key (opens a browser)
+```
+
+Both save the key to `~/.vicoa/credentials.json`, so subsequent commands pick it up automatically. If a command returns **401 Authentication failed**, your key has expired — run `vicoa --reauth`.
+
+Requests go to the agent-facing server `https://agents.vicoa.ai` by default. Point any command at a different backend with `--base-url`.
+
+## Starting a session
+
+Running `vicoa` with no subcommand starts an interactive agent in your terminal and registers it with your account, so it shows up in the mobile app and web dashboard.
+
+```bash
+vicoa                # Claude Code (the default agent)
+vicoa claude         # Claude Code, explicitly
+vicoa codex          # Codex
+vicoa opencode       # OpenCode
+vicoa --agent amp    # Amp
+```
+
+The `--agent` flag accepts `claude`, `amp`, `codex`, `opencode`, `cursor`, `gemini`, `copilot`, `kimi`, `hermes`, `pi`, `omp` (Oh My Pi), and `antigravity`.
+
+### Common launch flags
+
+| Flag | Meaning |
+|---|---|
+| `--name <text>` | Display name for the registered session |
+| `--task <TASK_UUID>` | Link the session to a task; the task's status then follows the session (a running session flips its task to `in_progress`) |
+| `--resume <SESSION_ID>` | Resume a previous session and mark it active |
+| `--agent <name>` | Which agent to run |
+| `--set-default [agent]` | Persist the default agent used by a bare `vicoa` run |
+| `--no-relay` | Run local-only — no live streaming to the dashboard |
+| `--no-daemon` | Don't auto-start the background daemon for this run |
+
+```bash
+# Start a named session linked to a task
+vicoa --name "Refactor auth" --task 5f2c9d1e-...-full-uuid
+
+# Resume where you left off
+vicoa --resume 3f9c1a2b-...-full-uuid
+
+# Make Codex your default agent for future bare `vicoa` runs
+vicoa --set-default codex
+```
+
+### vicoa daemon
+
+Start the background daemon. It registers this machine with your account and accepts remote and scheduled session spawns from the mobile app, web dashboard, and automations. Leave it running.
+
+```bash
+vicoa daemon
+```
+
+Starting a session with `vicoa` auto-starts the daemon if it isn't already running (unless you pass `--no-daemon`). See [Start a Remote Session](/docs/start-remote-session) for the full remote-session walkthrough.
+
+### vicoa headless
+
+Start a background agent with no local terminal UI, driven entirely from the web or mobile dashboard.
+
+```bash
+vicoa headless --agent codex --prompt "Run the test suite and summarize failures"
+```
+
+> **`vicoa headless` vs `vicoa session start`:** `headless` starts a background agent **on this machine**, right here. [`vicoa session start`](#vicoa-session-start) asks the backend to spawn one on **any** of your registered machines (including this one) — the terminal equivalent of the dashboard's "New Session". Reach for `session start` to launch a session on a different box, or when you want the same machine/agent/model picker the apps use.
+
+## vicoa ls
+
+List the active agent instances on the current machine, grouped by kind. This reads local OS processes — it only sees agents running on *this* box.
+
+```bash
+vicoa ls
+```
+
+```
+DAEMON SESSIONS (2)
+  AGENT      NAME             PROJECT    PID      AGE   ID
+  ------------------------------------------------------------------------------------------
+  claude     Refactor auth    my-app     10573    1d    7d4577a7-2c1e-4b8a-9f3d-5e6a7b8c9d01
+  codex      —                api        74527    3h    abcbe849-1f2e-4d3c-8b7a-6e5f4d3c2b10
+
+TUI SESSIONS (1)
+  AGENT      NAME             PROJECT    PID      AGE   ID
+  ------------------------------------------------------------------------------------------
+  claude     —                —          3415     2h    pid:3415
+```
+
+Columns:
+
+- **AGENT** — `claude`, `codex`, `opencode`, or `amp`.
+- **NAME** — the session title, when it has one.
+- **PROJECT** — the working directory (`—` when not detectable).
+- **PID** — the operating-system process ID.
+- **AGE** — how long the session has been running.
+- **ID** — the full session ID, the form every command takes. TUI sessions show `pid:<n>` instead, since their session ID isn't visible to `vicoa ls`.
+
+For scripting, output raw JSON instead of the table:
+
+```bash
+vicoa ls --json
+```
+
+Works on macOS, Linux, and Windows.
+
+> **`vicoa ls` vs `vicoa session ls`:** `vicoa ls` lists OS processes on *this* machine only. To see every session you own — across all machines, including cloud- or mobile-started and finished ones — use `vicoa session ls` below.
+
+## vicoa session
+
+The `session` commands talk to the backend, so they cover every session you own regardless of which machine started it. The read verbs (`ls`, `get`) are safe to run anytime; `start`, `update`, `message`, and `continue` change state or start real work.
+
+### vicoa session start
+
+Start a **new** session on one of your machines — the terminal equivalent of the desktop/web **"New Session"** composer. It picks a machine, directory, agent, and model/config, then hands the target machine's daemon a spawn request over REST (the same spawn path the apps drive). The session runs **headless** on that machine and streams to the mobile app and web dashboard, just like a remote session started from the UI.
+
+```bash
+# Start Claude Code on this host's daemon, in a directory
+vicoa session start --dir ~/projects/my-app
+
+# Pick a machine by name/hostname substring; name it and kick off with a prompt
+vicoa session start --machine laptop --dir ~/projects/api \
+  --name "Fix CI" --prompt "Run the test suite and fix the failures"
+
+# Codex with a model + reasoning effort, and block until it's actually running
+vicoa session start --dir ~/projects/api \
+  --agent codex --model gpt-5.5 --effort medium --wait
+```
+
+> **`vicoa session start` needs the target machine's daemon running.** The request is only picked up once that machine's `vicoa daemon` is connected. If the daemon looks offline, `start` refuses by default — pass `--allow-offline` to queue the request until the machine next reconnects.
+
+**Where it runs**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--machine <ID\|NAME>` | this host's daemon | Target machine: full id, or a display-name/hostname substring (`--list-machines` to see them) |
+| `--dir <PATH>` | — (**required**) | Directory on the target machine to start the session in |
+| `--allow-offline` | off | Queue the request even if the daemon looks offline (it runs when the daemon next reconnects) |
+
+**What to run**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--agent <name>` | `claude` | Agent to run: `claude`, `codex`, `opencode`, `cursor`, `gemini`, `copilot`, `kimi`, `hermes`, `pi`, or `omp` (not `amp`) |
+| `--model <slug>` | agent default | Model slug (`--list-models` to see options per agent) |
+| `--effort <level>` | agent default | Reasoning/thinking effort — **claude & codex only** |
+| `--permission-mode <mode>` | agent default | Permission mode (claude/codex/ACP agents) |
+| `--opencode-mode <build\|plan>` | — | OpenCode agent mode (opencode only) |
+| `--name <text>` | — | Name for the new session |
+| `--prompt <text>` | — | Optional first user message; omit to start the session blank |
+| `--task <TASK_UUID>` | — | Link the new session to a task (full UUID, from `vicoa task ls`) |
+
+**Kick-off & discovery**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--wait` | off | Poll until the session leaves `STARTING` (needs the daemon online) |
+| `--wait-timeout <SECS>` | 60 | How long to wait with `--wait` |
+| `--list-machines` | off | List your registered machines (id, name, hostname, online status) and exit |
+| `--list-models` | off | List agents/models/efforts/modes (optionally filtered by `--agent`) and exit |
+| `--json` | | Emit the spawn result as JSON, including `agent_instance_id` and `machine_id` |
+
+Discover what's available before you start:
+
+```bash
+vicoa session start --list-machines               # which machines can run a session
+vicoa session start --list-models                 # every agent's models/efforts/modes
+vicoa session start --list-models --agent codex    # just Codex's options
+```
+
+`session start` returns immediately with the new session id (the daemon launches it out of band), then points you at follow-ups:
+
+```
+Started claude session on Laptop in ~/projects/api — session inst-123.
+Track it with `vicoa session get inst-123` or send input with `vicoa session message inst-123 '...'`.
+```
+
+Add `--wait` when you want the command to block until the session is actually `ACTIVE` (or surfaces the error the daemon reported) instead of returning as soon as the request is accepted.
+
+### vicoa session ls
+
+List your sessions, newest first.
+
+```bash
+vicoa session ls                      # newest 50
+vicoa session ls --active --limit 20  # only still-running, cap at 20
+vicoa session ls --rate-limited       # only sessions currently blocked by a rate limit
+vicoa session ls --since 24h          # started in the last day
+vicoa session ls --since 2026-09-15 --until 2026-09-20   # the 15th through the 20th
+vicoa session ls --since yesterday --until yesterday     # all of yesterday
+vicoa session ls --limit 100 --offset 100               # the second page of 100
+vicoa session ls --json
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--active` | off | Only sessions still running |
+| `--rate-limited` | off | Only sessions a rate-limit window is currently blocking (adds a `RESET` column showing when each unblocks) |
+| `--since WHEN` | | Only sessions started at or after `WHEN` |
+| `--until WHEN` | | Only sessions started before `WHEN` |
+| `--limit N` | 50 | Max sessions to return (1–100) |
+| `--offset N` | 0 | Skip the newest `N` — page through with `--limit`; `--json` reports `total` and `has_more` |
+| `--json` | | Raw JSON `{items, total, limit, offset, has_more}` |
+
+`WHEN` accepts a date (`2026-09-20`), a datetime (`2026-09-20T14:30`, optionally with `Z` or an offset like `+08:00`), `today` / `yesterday`, or an age counted back from now (`30m`, `24h`, `7d`, `2w`). Times without an offset are your local time, the same zone the `STARTED` column prints in. A bare date on `--until` includes that whole day, so `--since 2026-09-20 --until 2026-09-20` is exactly the 20th. The window filters on when each session **started**, and `total` in `--json` counts the window.
+
+Columns: `AGENT`, `MODEL`, `STATUS`, `NAME`, `PROJECT`, `MSGS`, `STARTED`, `ID` (the full session ID).
+
+### vicoa session get
+
+Print one session's details and its message transcript. Every `session` command takes the **full session ID** that `vicoa session ls` prints. Short prefixes are not accepted, since one that names the right session today can name another after a delete.
+
+```bash
+vicoa session get <SESSION_ID>        # last 50 messages, clean chat view
+vicoa session get <SESSION_ID> --all  # the full transcript
+vicoa session get <SESSION_ID> --full # everything: timestamps, emails, control msgs, tool payloads
+vicoa session get <SESSION_ID> --json # {"instance": {...}, "messages": [...]}
+vicoa session get <SESSION_ID> --role user --all # only your messages, whole history
+```
+
+By default `session get` prints a clean chat log: tool-use header lines appear, but tool payloads, in-band control messages, timestamps, and sender emails are hidden. A footer reports how many messages and payloads were suppressed. Add flags to reveal what you need:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--limit N` | 50 | Show the newest N messages (ignored with `--all`) |
+| `--all` | off | Print the full transcript |
+| `--timestamps` | off | Show a timestamp on each message |
+| `--emails` | off | Show the sender email on user messages |
+| `--control` | off | Include in-band control messages |
+| `--tool-content` | off | Include tool-use payloads and diffs (tool **names** always show) |
+| `--full` | off | Everything at once: timestamps + emails + control + tool payloads |
+| `--role user\|agent` | both | Show only messages from that sender (filters the transcript **and** `--json`) |
+| `--json` | | Raw JSON of the instance and messages |
+
+> **`--role` filters after the fetch.** `--limit` counts messages of *every* sender, then `--role` narrows what's shown — so a plain `--role user` can surface only a handful from the fetched page. Pair it with `--all` to filter over the whole history. When the pre-filter limit hides messages, the text view prints a note pointing you at `--all`.
+
+### vicoa session update
+
+Rename a session, link it to a task, move it to a worktree, or file it under another project.
+
+```bash
+vicoa session update <SESSION_ID> --title "Refactor auth"
+vicoa session update <SESSION_ID> --task 5f2c9d1e-...-full-uuid
+vicoa session update <SESSION_ID> --unlink-task
+vicoa session update <SESSION_ID> --worktree feat/auth
+vicoa session update <SESSION_ID> --worktree main
+vicoa session update <SESSION_ID> --project VIC
+vicoa session update <SESSION_ID> --project none
+```
+
+| Flag | Meaning |
+|---|---|
+| `--title <text>` | Rename the session |
+| `--task <TASK_UUID>` | Link to this task |
+| `--unlink-task` | Clear the task link (mutually exclusive with `--task`) |
+| `--worktree <branch>` | File the session under the checkout of its repo that has `<branch>` checked out — a linked worktree, or the main checkout's branch to move it back |
+| `--project <project>` | File the session under this project: key (`VIC`), name, or id from `vicoa project ls`; `none` = No project |
+
+Linking drives the task's status from the session's status: a running linked session moves a `backlog` or `todo` task to `in_progress`, and the session finishing moves an `in_progress` task to `done`. A status someone set (in the app, or with `vicoa task update`, including from inside the session) is left alone, so an agent that marks its task `blocked` and then exits leaves it `blocked`.
+
+`--worktree` is for a session whose agent moved into a worktree on its own (the sidebar keeps it under the folder it was started in): the session's sidebar group and the folder its next resume launches in follow the new checkout, while the running agent is left where it is. A session started in a subfolder of the repo lands in the same subfolder of the target. The worktree is resolved with `git worktree list` on this machine, so run it where the session lives; the name is the checked-out branch (the label the sidebar shows), or the directory name for a detached checkout.
+
+`--project` is the CLI side of the **Project** menu on a session in the app's sidebar. It only changes which project the session is listed under: its folder stays the same, and so do the running agent and the folder a resume launches in. It takes your own projects; to file a session under a team project or one shared with you, use the app.
+
+### vicoa session message
+
+Send a message into a running session — it's delivered to the agent as user input and flips the session `ACTIVE`, the same as typing in the app. Pairs naturally with `session start`: start a session blank, then drive it with `message`. The id is the full session ID.
+
+```bash
+vicoa session message <SESSION_ID> "run the tests and fix any failures"
+```
+
+If the target machine is offline the message can't be delivered — retry once its daemon is back.
+
+### vicoa session continue
+
+Shorthand that sends the literal text `continue` into a session — handy after a rate-limit window resets (see `vicoa session ls --rate-limited`).
+
+```bash
+vicoa session continue <SESSION_ID>
+```
+
+### vicoa session share
+
+Create a public link to a session's transcript and print its URL — the same link the dashboard's Share dialog makes. Built for attaching the session that produced a change to its pull request:
+
+```bash
+vicoa session share <SESSION_ID>              # → https://vicoa.ai/share/<token>
+vicoa session share                           # inside a Vicoa session: shares *this* session
+vicoa session share --show-branch --expires 7 # show the git branch; dead after 7 days
+vicoa session share <SESSION_ID> --list       # the session's live links
+vicoa session share <SESSION_ID> --json       # the link record, with `url` added
+
+# Attach the session to the PR you just opened
+gh pr comment 123 --body "Session transcript: $(vicoa session share)"
+```
+
+On success it prints **only the URL**, so it drops straight into a `$(…)`. Running it again for the same session returns the **same link** when an equivalent live one exists (same audience and display options, no expiry) — pass `--new` to mint another. With no session id it shares the session the command runs inside (`VICOA_AGENT_INSTANCE_ID`).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--audience public\|authenticated` | `public` | Anyone with the link, or only signed-in Vicoa users |
+| `--expires DAYS` | never | Expire the link after `DAYS` (1–365); an expiring link is always newly minted |
+| `--show-owner` | off | Show your name and avatar on the shared page |
+| `--show-branch` | off | Show the git branch / worktree on the shared page |
+| `--new` | off | Mint a new link even if an equivalent live one exists |
+| `--list` | | List the session's live links instead of creating one |
+| `--web-url URL` | `VICOA_AUTH_URL` / `https://vicoa.ai` | Web app origin used to build the printed URL (self-hosted installs) |
+
+A shared page shows the transcript only: never the machine, the working directory, or session secrets. The viewer is the same page the dashboard's share links open, so what a link shows is documented there.
+
+### vicoa session unshare
+
+Revoke a link. A revoked URL stops working everywhere it was pasted, so this never guesses which one:
+
+```bash
+vicoa session unshare <SESSION_ID> --link <LINK_ID> # one link, by its id from --list
+vicoa session unshare <SESSION_ID> --all         # every live link on the session
+```
+
+With neither flag it prints the live links and exits without revoking anything.
+
+## vicoa stop
+
+Stop the daemon, the daemon's headless sessions, or both. Every `vicoa stop` command asks for confirmation before doing anything.
+
+### vicoa stop daemon
+
+Stop the background daemon. Any headless sessions it started keep running.
+
+```bash
+vicoa stop
+# or, equivalently
+vicoa stop daemon
+```
+
+```
+Stop the Vicoa daemon for https://agents.vicoa.ai (pid 1234)? [y/N]
+```
+
+`vicoa stop` with no argument defaults to `daemon`.
+
+If you run multiple daemons on the same machine (one per `--base-url`), `vicoa stop daemon` stops **all** of them. The prompt lists each one so you can see what's about to be terminated:
+
+```
+Stop 2 Vicoa daemon(s)?
+  - https://agents.vicoa.ai (pid 12345)
+  - https://staging.vicoa.example (pid 67890)
+[y/N]
+```
+
+To target just one daemon, pass the same `--base-url` you used to start it:
+
+```bash
+vicoa stop daemon --base-url https://staging.vicoa.example
+```
+
+### vicoa stop sessions
+
+Stop every headless session the daemon started. The daemon itself keeps running.
+
+```bash
+vicoa stop sessions
+```
+
+```
+Stop 3 headless session(s)? [y/N]
+```
+
+Limit it to one agent type with `--agent`:
+
+```bash
+vicoa stop sessions --agent claude
+```
+
+Valid values are `claude`, `codex`, `opencode`, and `amp`.
+
+Each session is asked to shut down gracefully first; if it doesn't exit within a short grace period it is force-stopped. Stopped sessions are marked with a terminal status in the dashboard.
+
+### vicoa stop &lt;session-id&gt;
+
+Stop one specific session by the full ID shown in `vicoa ls`:
+
+```bash
+vicoa stop 7d4577a7-2c1e-4b8a-9f3d-5e6a7b8c9d01
+```
+
+```
+Stop session 7d4577a7-2c1e-4b8a-9f3d-5e6a7b8c9d01? [y/N] y
+  ✓ 7d4577a7-2c1e-4b8a-9f3d-5e6a7b8c9d01 (claude, pid=10573) — Stopped
+```
+
+### vicoa stop all
+
+Stop the headless sessions first, then the daemon.
+
+```bash
+vicoa stop all
+```
+
+### Skipping confirmation
+
+Pass `-y` (or `--yes`) to skip the confirmation prompt — useful in scripts.
+
+```bash
+vicoa stop sessions --agent codex --yes
+```
+
+### vicoa disconnect
+
+Alias for `vicoa stop daemon`. Stops only the daemon.
+
+```bash
+vicoa disconnect
+```
+
+## vicoa task
+
+Manage your task backlog from the terminal. The read verbs (`ls`, `get`, `comments`) are safe; `create`, `update`, `comment`, and `delete` change your backlog.
+
+**Statuses:** `backlog` `todo` `in_progress` `in_review` `done` `blocked` `cancelled`
+**Priorities:** `urgent` `high` `medium` `low` `none`
+
+```bash
+# List and inspect
+vicoa task ls                                   # all tasks
+vicoa task ls --project VIC                     # one project, by key, name, or id
+vicoa task ls --project none                    # the unfiled ones (No project)
+vicoa task ls --label growth --status todo      # tagged growth AND todo
+vicoa task ls --json
+vicoa task get VIC-42                           # full detail
+
+# Create
+vicoa task create "Fix the flaky login test"
+vicoa task create "Ship pricing page" --project VIC --priority high --status todo \
+  --label growth --description "Localize copy first" --due 2026-08-25
+
+# Update (only the flags you pass change; several refs apply the same change to each)
+vicoa task update VIC-42 --status in_progress
+vicoa task update VIC-42 --priority urgent --title "New title"
+vicoa task update VIC-20 VIC-21 VIC-22 --project VIC2       # move three tasks
+vicoa task update VIC-42 --add-label bug --remove-label growth
+vicoa task update VIC-42 --label a --label b               # set the labels to exactly these
+
+# Comment
+vicoa task comment VIC-42 "Fixed — the flake was a missing await."
+vicoa task comment VIC-42 - < report.md                    # body from stdin
+vicoa task comments VIC-42 --activity                      # the thread + change log
+
+# Delete (-y skips the confirm prompt)
+vicoa task delete VIC-42 -y
+```
+
+**Refer to a task by its identifier.** `VIC-42` — the `KEY` column of `task ls`, the header of the task page, and what you'd say out loud — works everywhere a task reference is taken: the positional argument on `get`/`update`/`delete`/`comment`/`comments`, and `--parent`. A full UUID works too. (A task filed under No project has no identifier; use its UUID. `vicoa --task` and `session update --task` still take the UUID.)
+
+**Refer to a project by its key.** `--project` takes the project's task key (`VIC`, the prefix on every identifier), its name, or its id — `vicoa project ls` shows all three — and `none` for **No project**. Moving a task between projects **reassigns its identifier** (numbers are per project), and `update` prints the change as `VIC-20 → VIC2-2`. Moving a task to `none` drops its identifier.
+
+**Labels go by name.** `--label`, `--add-label`, and `--remove-label` take label names (`vicoa label ls`); every flag repeats. On `ls`, several `--label`s mean the task must carry *all* of them. On `update`, `--label` replaces the whole set, while `--add-label` / `--remove-label` keep the rest.
+
+`create` defaults to `status=backlog`, `priority=none`, and files under **No project** unless you pass `--project`.
+
+**Run inside a Vicoa session, `create`, `update`, and `comment` record that session.** The task page then shows *Created in &lt;session&gt;* under the title and *via &lt;session&gt;* on the comment or change, and the session's header lists the tasks it created. Nothing to pass: the CLI reads the session from `VICOA_AGENT_INSTANCE_ID`.
+
+| Flag (create / update) | Meaning |
+|---|---|
+| `--description <text>` | Longer body; `-` reads it from stdin (`--description - < plan.md`) |
+| `--project <KEY\|NAME\|ID\|none>` | Project to file under / move to (`none` = No project) |
+| `--status <status>` | Task status (enum above) |
+| `--priority <priority>` | Task priority (enum above) |
+| `--label <name>` | Label to apply (repeatable); on `update`, sets the labels to exactly these |
+| `--add-label <name>` / `--remove-label <name>` | Add / remove one label, keeping the rest (`update` only; repeatable) |
+| `--parent <TASK>` | Make it a subtask of another task (`VIC-42` or UUID) |
+| `--start <ISO8601>` | Start date, e.g. `2026-08-01` |
+| `--due <ISO8601>` | Due date, e.g. `2026-08-01T17:00:00Z` |
+| `--title <text>` | New title (`update` only; `create` takes the title as its argument) |
+| `--json` | Raw JSON — a bare array from `ls`; `update` prints one object for one ref, a list for several |
+
+Columns of `task ls`: `KEY` (identifier), `STATUS`, `PRIO`, `PROJECT` (name), `TITLE`, `ID` (full UUID). `--json` rows carry `project_id` and `project_name`.
+
+> **`update` is a PATCH** — pass at least one field, or it errors. With several refs, a ref that fails (typo, 404) is reported on stderr and the rest still run; the exit code is `1` if any failed.
+
+## vicoa project
+
+Read-only list of your projects — where the keys and ids `--project` takes come from.
+
+```bash
+vicoa project ls                     # ID, KEY, NAME, PATH (this machine's checkout), TASKS (open)
+vicoa project ls --include-archived
+vicoa project get VIC                # by key, name, or id: details + every machine's checkout path
+vicoa project ls --json
+```
+
+Projects are created and edited in the apps (a project appears automatically the first time a session runs in a folder). `TASKS` counts open tasks — everything but `done` and `cancelled`.
+
+## vicoa label
+
+Your task-label vocabulary — one set of labels across every project, the same list as Settings → Tasks.
+
+```bash
+vicoa label ls
+vicoa label create growth                    # colour picked from the name, as the web does
+vicoa label create ops --color "#3b82f6"
+```
+
+Rename, recolour, and delete stay in the apps. `create` refuses a name that already exists, so `--label <name>` can never be ambiguous.
+
+## vicoa automation
+
+An automation is a saved **prompt + agent/model + machine/folder + schedule**. The server's scheduler fires it, spawning a real agent session at the scheduled time. These commands are **CRUD only** — there is no "run now"; to run something immediately, start a session directly instead.
+
+```bash
+# Inspect
+vicoa automation ls
+vicoa automation get <AUTOMATION_UUID>
+vicoa automation runs <AUTOMATION_UUID>        # run history
+
+# Create: pass exactly one schedule + a session config
+vicoa automation create "Nightly triage" \
+  --prompt "Triage new GitHub issues and label them" \
+  --agent claude --daily --time 22:00 --timezone America/New_York
+
+vicoa automation create "Hourly build check" \
+  --prompt "Run the build and report failures" \
+  --agent codex --hourly --minute 15
+
+# Keep going in one session instead of starting a new one each run
+vicoa automation create "Check CI" \
+  --prompt "Is CI green yet? If not, fix what broke." \
+  --session <SESSION_UUID> --hourly
+
+# Pause, resume, edit, delete
+vicoa automation update <AUTOMATION_UUID> --disable
+vicoa automation update <AUTOMATION_UUID> --enable --prompt "New prompt"
+vicoa automation delete <AUTOMATION_UUID> -y
+```
+
+### Schedule
+
+Choose **exactly one** schedule selector when you create an automation:
+
+| Flag | Meaning |
+|---|---|
+| `--at <ISO8601>` | Run once at this UTC instant, e.g. `2026-08-10T09:00:00Z` |
+| `--daily` | Every day at `--time` |
+| `--hourly` | Every hour at `--minute` |
+| `--weekdays` | Mon–Fri at `--time` |
+| `--weekly <DAYS>` | Weekly on these weekdays, `0=Sun…6=Sat`, e.g. `--weekly 1,3,5` |
+| `--frequency-json <JSON>` | Raw frequency object for custom or interval schedules |
+
+Modifiers: `--time HH:MM` (default `09:00`, for daily/weekdays/weekly), `--minute M` (default `0`, for hourly), and `--timezone <IANA>` (default UTC). On `update`, passing a selector re-times the automation; passing none leaves the schedule alone.
+
+### What to run
+
+Give it a session config with the convenience flags, or a full JSON blob:
+
+| Flag | Meaning |
+|---|---|
+| `--agent <name>` | Agent to run, e.g. `claude`, `codex`, `opencode` (required unless `--session-config-json`) |
+| `--model <slug>` | Model slug for the agent |
+| `--effort <level>` | Reasoning/thinking effort — **claude & codex only** |
+| `--permission-mode <mode>` | Agent permission mode, e.g. `plan`, `acceptEdits` |
+| `--session-config-json <JSON>` | Full config object; overrides the above; must include `"agent"` |
+| `--agent-profile <NAME>` | Run a saved agent (`vicoa agent ls`) instead of the flags above. Each run uses the agent as it is at that time, and its session shows as that agent. On `update`, `none` unlinks it |
+
+### Where it runs
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--machine-id <id>` | this machine's registered daemon | Machine to run on |
+| `--directory <path>` | current dir | Working directory on that machine |
+| `--worktree-json <JSON>` | — | Worktree spec, e.g. `{"mode":"new"}` |
+| `--session <SESSION_UUID>` | — | Run every fire in this existing session instead of starting a new one. Each run sends the prompt to it, resuming the session first if it has stopped. The session brings its own machine, folder and agent, so it can't be combined with the flags above. On `update`, `none` goes back to a new session each run |
+| `--disabled` | | Create the automation paused (`enabled=false`) |
+
+> **An automation needs a machine to run on.** Run `vicoa daemon` on the target box first — it auto-registers and becomes the default target — or pass `--machine-id`. Also note `automation update` has no `--agent` flag; change the agent by replacing the whole config with `--session-config-json '{"agent":"…"}'`.
+
+## vicoa worktree
+
+A repository can declare **worktree setup commands** in a committed `.vicoa/config.json` (or root `vicoa.json`) — copy `.env` files, install dependencies, link a shared database — and the daemon runs them in the background every time it creates a worktree for a new session, whichever device you started it from. `vicoa worktree setup` is the same run, on demand, from a terminal:
+
+```bash
+vicoa worktree setup                 # set up the worktree you're in
+vicoa worktree setup ~/path/to/worktree
+vicoa worktree setup --dry-run       # just list the commands
+vicoa worktree setup --trust         # …and let the daemon auto-run this repo's setup from now on
+```
+
+```json
+// .vicoa/config.json, committed in the source repository
+{
+  "worktree": {
+    "setup": [
+      "cp \"$VICOA_ROOT_PATH/.env\" \"$VICOA_WORKTREE_PATH/.env\"",
+      "pnpm install"
+    ],
+    "teardown": ["echo bye"]
+  }
+}
+```
+
+Each command is echoed, then run in the worktree with `bash` (PowerShell on Windows) and `$VICOA_WORKTREE_PATH`, `$VICOA_ROOT_PATH` (the main checkout the config came from) and `$VICOA_BRANCH_NAME` set; the run stops at the first failure and the command's exit code is returned. Commands see the environment of whatever runs them: your terminal's for `vicoa worktree setup`, and the daemon's for automatic setup (the terminal it was started from, or, under the desktop app, your login shell read at launch). So a tool your terminal can run works in setup too; if automatic setup says `command not found` anyway, `daemon-env.log` in the desktop app's data folder (`~/Library/Application Support/Vicoa` on macOS) shows where the daemon's environment came from. The config is always read from the **source** repository's working tree, so a linked worktree runs the same setup as the checkout it was forked from. Use it to re-run after a failed automatic setup, to try a config while you are editing it, or — from an agent — to bring up a worktree whose setup did not run.
+
+| Flag | Meaning |
+|---|---|
+| `--dry-run` | Print the numbered command list; run nothing |
+| `--trust` | Mark the source repository as trusted on this machine so new worktrees set up automatically |
+| `--force` | Run even while another setup run for the same worktree is in progress |
+
+> **Trust.** A cloned repository's `vicoa.json` can contain arbitrary shell, so the daemon only **auto-runs** setup for repositories you have approved on that machine (the dashboard asks the first time). Typing `vicoa worktree setup` yourself is that approval for one run — nothing is gated — and `--trust` records it for the future. The run's progress and log are what the session header's setup badge shows in the dashboard.
+
+## Machine-readable output
+
+Every `session`, `task`, `project`, `label`, `agent`, and `automation` subcommand — plus `vicoa ls` — accepts `--json`, which emits raw JSON instead of the human-readable table. Prefer it whenever you're parsing a field in a script rather than scraping the table.
+
+Paginated lists (`session ls`) come wrapped — `{items, total, limit, offset, has_more}` — so the page can say how much is left. Everything else (`task ls`, `project ls`, `label ls`) is the bare array the API returns.
+
+```bash
+vicoa session ls --active --json | jq '.items[].id'
+vicoa task ls --project VIC --json | jq '.[].identifier'
+```
+
+The "new version available" banner goes to **stderr**, so it never lands in a `--json` pipe — don't merge streams with `2>&1` before parsing.
+
+## Errors & recovery
+
+| Message / symptom | Fix |
+|---|---|
+| `Authentication failed … run vicoa --reauth` (HTTP 401) | Your key is invalid or expired — run `vicoa --reauth`. |
+| `No Vicoa API key found` | Sign in with `vicoa --auth`, set `VICOA_API_KEY`, or pass `--api-key`. |
+| `No machine to run on` (automation create) | Run `vicoa daemon` on the target machine first, or pass `--machine-id`. |
+| `Daemon on <machine> looks offline` (session start) | Start `vicoa daemon` on that machine, or pass `--allow-offline` to queue the request until it reconnects. |
+| `--dir is required to start a session` | `vicoa session start` needs `--dir <PATH>`; run it with `--list-machines` / `--list-models` first to see your options. |
+| `'<ref>' is not a session id` | Pass the full session ID from `vicoa session ls` (or `vicoa ls`); short prefixes are not accepted. |
+| `'<ref>' is ambiguous` (`--machine`) | The name or hostname matched more than one machine; pass more of it, or the full machine id. |
+| `404` on `task get/update/delete` | Use the `VIC-42` identifier or the **full UUID** from the `ID` column. |
+| `no project with key or name '…'` / `N projects are named '…'` | `--project` matches a key, name, or id exactly — run `vicoa project ls`; when two projects share a name, pass the key or id. |
+| `no label named '…'` | `--label` takes an existing name — `vicoa label ls`, or `vicoa label create <name>`. |
+| `no session given and VICOA_AGENT_INSTANCE_ID is not set` | `session share`/`unshare` without an id only work inside a Vicoa session; pass the session id. |
+| `Nothing to update — pass at least one field` | `update` is a PATCH; pass at least one flag, e.g. `--status done`. |
+| `Aborted (pass --yes to delete non-interactively)` | Re-run `delete` with `-y`. |
+| `pass only one schedule (… are mutually exclusive)` | `automation create` takes exactly one of `--at`/`--daily`/`--hourly`/`--weekdays`/`--weekly`/`--frequency-json`. |
+
+## Related
+
+- [Start a Remote Session](/docs/start-remote-session) — how `vicoa daemon` and remote sessions work.
+- [Getting Started](/docs/getting-started) — install the CLI and register your first machine.
+- [Agents](/docs/agents) — pick between Claude Code, Codex, and OpenCode.
+- [Troubleshooting](/docs/troubleshooting) — common issues with the daemon and sessions.

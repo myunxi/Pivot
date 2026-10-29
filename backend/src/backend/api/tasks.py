@@ -1,0 +1,996 @@
+"""Projects & tasks API (tasks-and-projects plan §3).
+
+Human-authored task tracker: issue-style tasks grouped by project. Distinct
+from agent sessions — the Kanban tab is sessions; this is the human backlog.
+
+Every query call here passes ``sharing=True``: this is the human dashboard,
+the one surface that resolves project grants and team membership
+(collaboration §4). Reads need ``viewer``, comments/reactions ``commenter``,
+task writes ``editor``, project settings ``admin``, project deletion ``owner``.
+The query layer raises ``AccessDenied`` (→ 403 via the app handler) for a
+visible-but-insufficient role and returns ``None`` (→ 404 here) for an
+invisible one. The agent-facing twin, ``servers/api/tasks.py``, stays on the
+owner-only lens by design.
+"""
+
+import logging
+from datetime import datetime
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy.orm import Session
+
+from shared import access, project_icons, storage
+from shared.database.collab_models import Team
+from shared.database.models import User
+from shared.database.session import get_db
+from shared.database.task_models import Project, Task
+from shared.images import InvalidImageError, process_image
+
+from ..auth.dependencies import get_current_user
+from ..db import collab_queries, task_queries, task_timeline_queries
+from ..db.queries import list_task_instances
+from ..db.task_serializers import serialize_task, serialize_tasks
+from ..db.task_queries import (
+    AssigneeNotFoundError,
+    LabelNotFoundError,
+    ProjectKeyTakenError,
+    MachineNotFoundError,
+    ParentTaskError,
+    ProjectNotFoundError,
+    TeamNotFoundError,
+)
+from ..models import (
+    AgentInstanceResponse,
+    CreateTaskCommentRequest,
+    ToggleTaskReactionRequest,
+    TaskTimelineResponse,
+    UpdateTaskCommentRequest,
+    CreateProjectRequest,
+    CreateTaskLabelRequest,
+    CreateTaskRequest,
+    ProjectOrderResponse,
+    PrincipalResponse,
+    ProjectResponse,
+    ProjectSummaryResponse,
+    SetProjectDirectoryRequest,
+    SetProjectOrderRequest,
+    TaskLabelResponse,
+    TaskPriorityLiteral,
+    TaskResponse,
+    TaskStatusLiteral,
+    TransferProjectRequest,
+    UpdateProjectRequest,
+    UpdateTaskLabelRequest,
+    UpdateTaskRequest,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["tasks"])
+
+# Bounds the request body for an icon upload; decode memory is bounded
+# separately by shared.images.MAX_PIXELS.
+MAX_ICON_UPLOAD_BYTES = 8 * 1024 * 1024
+# The raster types process_image emits — served inline; anything else is a bug.
+_INLINE_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+@router.get("/projects", response_model=list[ProjectResponse])
+def list_projects_endpoint(
+    background_tasks: BackgroundTasks,
+    include_archived: bool = False,
+    machine_id: UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ProjectResponse]:
+    """The caller's projects, most recent activity first. `machine_id` narrows
+    to projects linked to a folder on that machine (the new-session picker)."""
+    rows = task_queries.list_projects(
+        db, current_user.id, include_archived, sharing=True, machine_id=machine_id
+    )
+    projects = [project for project, _, _ in rows]
+    accesses = access.project_accesses(db, current_user.id, projects)
+    # Lazy, best-effort default-icon seed (§4e): first fetch of a git-backed
+    # project with no icon set kicks off a background owner-avatar seed. The
+    # task re-checks eligibility, so duplicate enqueues are harmless. Only the
+    # owner's own fetch seeds — a grantee's view never mutates the project.
+    for project in projects:
+        if (
+            project.user_id == current_user.id
+            and project.git_remote_url
+            and project.icon_source is None
+            and not project.icon_image_uri
+            # An emoji is an explicit choice — never overwrite it with a git seed.
+            and not project.icon
+        ):
+            background_tasks.add_task(project_icons.seed_project_icon, project.id)
+    owners = _project_owners(db, current_user.id, projects)
+    followed = task_queries.followed_project_ids(db, current_user.id, list(owners))
+    my_teams = access.active_team_ids(db, current_user.id) if owners else set()
+    return [
+        _project_response(
+            p,
+            accesses.get(p.id),
+            viewer_id=current_user.id,
+            owner=owners.get(p.id),
+            followed=_in_own_list(p, owners, followed, my_teams),
+            team_member=p.team_id is not None and p.team_id in my_teams,
+            last_activity_at=last_at,
+            position=position,
+        )
+        for p, last_at, position in rows
+    ]
+
+
+# Declared before the `/projects/{project_id}` routes on purpose: a literal
+# segment only wins over a path parameter if it is matched first, and
+# `{project_id}` is typed UUID, so "order" would otherwise be a 422.
+@router.put("/projects/order", response_model=ProjectOrderResponse)
+def set_project_order_endpoint(
+    request: SetProjectOrderRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectOrderResponse:
+    """Replace the caller's manual project order (sidebar drag-and-drop). It
+    is the caller's own view, so any project they can see — shared ones
+    included — may be ranked, and ranking never touches the project itself.
+    Ids the caller cannot see are dropped, not rejected (see the query)."""
+    stored = task_queries.set_project_order(
+        db, current_user.id, request.project_ids, sharing=True
+    )
+    return ProjectOrderResponse(project_ids=stored)
+
+
+def _project_response(
+    project: Project,
+    project_access: access.ProjectAccess | None,
+    *,
+    viewer_id: UUID,
+    owner: PrincipalResponse | None = None,
+    followed: bool | None = None,
+    team_member: bool = False,
+    last_activity_at: datetime | None = None,
+    position: int | None = None,
+) -> ProjectResponse:
+    """Serialize with the caller's standing on the project.
+
+    Every project response goes through here. `role` / `scopes` describe the
+    caller, not the row, so they have to be resolved per request — the model
+    defaults them to the least privilege precisely so that forgetting is a
+    hidden button rather than a phantom one. `last_activity_at` and `position`
+    are only known to the list query; single-project responses leave them
+    unset.
+
+    `directories` keeps only the caller's own rows. A directory is "where MY
+    copy of this project lives" (any contributor may link their own machine),
+    so on a shared project the other rows are someone else's machine names
+    and absolute paths — nothing the caller can use, and nothing they should
+    read.
+    """
+    response = ProjectResponse.model_validate(project)
+    if project_access is not None:
+        response.role = project_access.role
+        response.scopes = list(project_access.scopes)  # type: ignore[assignment]
+    mine = {d.machine_id for d in project.directories if d.user_id == viewer_id}
+    response.directories = [d for d in response.directories if d.machine_id in mine]
+    response.owner = owner
+    # Unknown to a caller that did not look it up: an owned project is always
+    # listed, a shared one only when the list query says it is followed.
+    response.followed = owner is None if followed is None else followed
+    response.is_team_member = team_member
+    response.last_activity_at = last_activity_at
+    response.position = position
+    return response
+
+
+def _in_own_list(
+    project: Project,
+    owners: dict[UUID, PrincipalResponse],
+    followed: set[UUID],
+    my_teams: set[UUID],
+) -> bool:
+    """Whether the project sits in the caller's own list rather than under
+    "Shared with me": always for one they own personally, and for a team's
+    project when they are on that team — it is their team's work, not
+    something shared with them — otherwise only once they follow it."""
+    return (
+        project.id not in owners
+        or (project.team_id is not None and project.team_id in my_teams)
+        or project.id in followed
+    )
+
+
+def _project_owners(
+    db: Session, viewer_id: UUID, projects: list[Project]
+) -> dict[UUID, PrincipalResponse]:
+    """Who owns each project the caller does not: the team for a team-owned
+    one, else the owning user. Two queries for the whole list; the caller's
+    own personal projects are skipped, so a solo sidebar costs nothing."""
+    foreign = [
+        p for p in projects if not (p.team_id is None and p.user_id == viewer_id)
+    ]
+    if not foreign:
+        return {}
+    user_ids = {p.user_id for p in foreign if p.team_id is None}
+    team_ids = {p.team_id for p in foreign if p.team_id is not None}
+    users = (
+        {u.id: u for u in db.query(User).filter(User.id.in_(user_ids))}
+        if user_ids
+        else {}
+    )
+    teams = (
+        {t.id: t for t in db.query(Team).filter(Team.id.in_(team_ids))}
+        if team_ids
+        else {}
+    )
+    out: dict[UUID, PrincipalResponse] = {}
+    for project in foreign:
+        if project.team_id is not None:
+            team = teams.get(project.team_id)
+            if team is not None:
+                out[project.id] = PrincipalResponse(
+                    type="team",
+                    id=team.id,
+                    name=team.name,
+                    avatar_image_uri=team.avatar_image_uri,
+                    updated_at=team.updated_at,
+                )
+            continue
+        user = users.get(project.user_id)
+        if user is not None:
+            out[project.id] = PrincipalResponse(
+                type="user",
+                id=user.id,
+                # display_name only — never the owner's email (§10.4).
+                name=user.display_name,
+                avatar_image_uri=user.avatar_image_uri,
+                emoji=user.avatar_emoji,
+                updated_at=user.updated_at,
+            )
+    return out
+
+
+def _project_response_for(
+    db: Session, user_id: UUID, project: Project
+) -> ProjectResponse:
+    """`_project_response` for a single project, resolving the caller's standing.
+
+    The list endpoint batches this with `access.project_accesses`; everything
+    that returns one project uses this.
+    """
+    owners = _project_owners(db, user_id, [project])
+    my_teams = access.active_team_ids(db, user_id) if owners else set()
+    return _project_response(
+        project,
+        access.project_access(db, user_id, project),
+        viewer_id=user_id,
+        owner=owners.get(project.id),
+        followed=_in_own_list(
+            project,
+            owners,
+            task_queries.followed_project_ids(db, user_id, list(owners)),
+            my_teams,
+        ),
+        team_member=project.team_id is not None and project.team_id in my_teams,
+    )
+
+
+def _set_followed(
+    db: Session, user_id: UUID, project_id: UUID, *, followed: bool
+) -> ProjectResponse:
+    # Any standing that can see the project: this is the caller's own view,
+    # like the project order. (A board-only grantee has no sessions to show
+    # there, so the client only offers it with the sessions scope.)
+    project = task_queries.get_accessible_project(db, user_id, project_id, sharing=True)
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    owned = project.team_id is None and project.user_id == user_id
+    if not owned:
+        task_queries.set_project_followed(db, user_id, project.id, followed=followed)
+    return _project_response_for(db, user_id, project)
+
+
+@router.put("/projects/{project_id}/follow", response_model=ProjectResponse)
+def follow_project_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Follow a project shared with the caller into their own list: it
+    leaves "Shared with me" for their project list, other people's sessions
+    in it under its Team row. The caller's view only — the project itself is
+    untouched, so any role that can see it may do it. A no-op for one they
+    own."""
+    return _set_followed(db, current_user.id, project_id, followed=True)
+
+
+@router.delete("/projects/{project_id}/follow", response_model=ProjectResponse)
+def unfollow_project_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Undo `PUT …/follow`: back under "Shared with me". Access unchanged."""
+    return _set_followed(db, current_user.id, project_id, followed=False)
+
+
+@router.post(
+    "/projects",
+    response_model=ProjectResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_project_endpoint(
+    request: CreateProjectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    project = task_queries.create_project(
+        db,
+        current_user.id,
+        name=request.name,
+        color=request.color,
+        icon=request.icon,
+        git_remote_url=request.git_remote_url,
+    )
+    return _project_response_for(db, current_user.id, project)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+def update_project_endpoint(
+    project_id: UUID,
+    request: UpdateProjectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    fields = request.model_dump(exclude_unset=True)
+    try:
+        project = task_queries.update_project(
+            db, current_user.id, project_id, fields, sharing=True
+        )
+    except ProjectKeyTakenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    return _project_response_for(db, current_user.id, project)
+
+
+@router.post("/projects/{project_id}/transfer", response_model=ProjectResponse)
+def transfer_project_endpoint(
+    project_id: UUID,
+    request: TransferProjectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse | JSONResponse:
+    """Move a project into a team, or out of one into the caller's personal
+    space (collaboration §3.3). Owner only — the same floor as deleting it.
+
+    409 when the project's task key is already used in the destination:
+    ``{"detail", "code": "project_key_taken", "key", "suggested_key"}``, so the
+    client can offer the free key and resend with ``key`` set (§3.5)."""
+    project = task_queries.get_accessible_project(
+        db, current_user.id, project_id, sharing=True, minimum="owner"
+    )
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    try:
+        moved = collab_queries.transfer_project(
+            db, current_user, project, team_id=request.team_id, key=request.key
+        )
+    except collab_queries.TeamNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from exc
+    except collab_queries.TeamPermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except collab_queries.ProjectKeyConflictError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "code": "project_key_taken",
+                "key": exc.key,
+                "suggested_key": exc.suggested_key,
+            },
+        )
+    return _project_response_for(db, current_user.id, moved)
+
+
+@router.get("/projects/{project_id}/summary", response_model=ProjectSummaryResponse)
+def get_project_summary_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectSummaryResponse:
+    """What a delete would file under No project — for the confirm dialog."""
+    summary = task_queries.project_summary(
+        db, current_user.id, project_id, sharing=True
+    )
+    if summary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    task_count, session_count, active_session_count = summary
+    return ProjectSummaryResponse(
+        task_count=task_count,
+        session_count=session_count,
+        active_session_count=active_session_count,
+    )
+
+
+@router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete the project. Its tasks and sessions are filed under No project
+    (tasks lose their identifier); nothing of the user's work is destroyed."""
+    deleted = task_queries.delete_project(db, current_user.id, project_id, sharing=True)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+
+
+@router.put("/projects/{project_id}/directories", response_model=ProjectResponse)
+def set_project_directory_endpoint(
+    project_id: UUID,
+    request: SetProjectDirectoryRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Link the project to a path on one machine (upsert on that machine)."""
+    try:
+        project = task_queries.set_project_directory(
+            db,
+            current_user.id,
+            project_id,
+            machine_id=request.machine_id,
+            local_path=request.local_path.strip(),
+            sharing=True,
+        )
+    except MachineNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    return _project_response_for(db, current_user.id, project)
+
+
+@router.delete(
+    "/projects/{project_id}/directories/{machine_id}",
+    response_model=ProjectResponse,
+)
+def delete_project_directory_endpoint(
+    project_id: UUID,
+    machine_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Unlink a machine. Idempotent — unlinking twice is not an error."""
+    project = task_queries.delete_project_directory(
+        db, current_user.id, project_id, machine_id, sharing=True
+    )
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    return _project_response_for(db, current_user.id, project)
+
+
+@router.put("/projects/{project_id}/icon", response_model=ProjectResponse)
+def upload_project_icon_endpoint(
+    project_id: UUID,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Set a project's image icon from an upload (§4d). 'user' beats a git seed."""
+    project = task_queries.get_accessible_project(
+        db, current_user.id, project_id, sharing=True, minimum="admin"
+    )
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+
+    raw = file.file.read(MAX_ICON_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_ICON_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image exceeds {MAX_ICON_UPLOAD_BYTES // (1024 * 1024)}MB limit",
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="File is empty")
+    try:
+        processed = process_image(raw)
+    except InvalidImageError as exc:
+        raise HTTPException(
+            status_code=400, detail="Not a valid image in a supported format"
+        ) from exc
+
+    key = storage.project_icon_key(str(project_id))
+    try:
+        storage.upload_attachment(key, processed.data, processed.mime_type)
+    except Exception as exc:
+        logger.exception("project icon upload to S3 failed")
+        raise HTTPException(status_code=502, detail="Failed to store image") from exc
+
+    updated = task_queries.set_project_icon(
+        db,
+        current_user.id,
+        project_id,
+        icon_image_uri=project_icons.icon_served_url(project_id),
+        icon_source="user",
+        sharing=True,
+    )
+    assert updated is not None  # access re-checked above under the same session
+    return _project_response_for(db, current_user.id, updated)
+
+
+@router.get("/projects/{project_id}/icon")
+def get_project_icon_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve a project's icon bytes (uploaded or git-seeded). Any visible role."""
+    project = task_queries.get_accessible_project(
+        db, current_user.id, project_id, sharing=True
+    )
+    if project is None or not project.icon_image_uri:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project icon not found"
+        )
+    try:
+        data, content_type = storage.download_object(
+            storage.project_icon_key(str(project_id))
+        )
+    except Exception as exc:
+        logger.exception("project icon download from S3 failed")
+        raise HTTPException(status_code=502, detail="Failed to fetch image") from exc
+    if content_type not in _INLINE_IMAGE_TYPES:
+        content_type = "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            # Short-lived: the URL is stable across replacements, so clients
+            # cache-bust with the project's updated_at instead of relying on this.
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.delete("/projects/{project_id}/icon", response_model=ProjectResponse)
+def delete_project_icon_endpoint(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    """Reset the icon to the generated default (drops the image AND emoji, and
+    pins icon_source so the git seed does not re-add an image)."""
+    project = task_queries.get_accessible_project(
+        db, current_user.id, project_id, sharing=True, minimum="admin"
+    )
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        )
+    if project.icon_image_uri:
+        try:
+            storage.delete_object(storage.project_icon_key(str(project_id)))
+        except Exception:
+            # Orphaned S3 object is harmless; never fail the reset on it.
+            logger.warning("project icon S3 delete failed for %s", project_id)
+    updated = task_queries.reset_project_icon(
+        db, current_user.id, project_id, sharing=True
+    )
+    assert updated is not None
+    return _project_response_for(db, current_user.id, updated)
+
+
+@router.get("/task-labels", response_model=list[TaskLabelResponse])
+def list_labels_endpoint(
+    project_id: UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TaskLabelResponse]:
+    """The caller's labels (personal + their teams'), or with ``project_id``
+    that project's vocabulary — what a shared board's label picker needs."""
+    try:
+        labels = task_queries.list_labels(
+            db, current_user.id, sharing=True, project_id=project_id
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return [TaskLabelResponse.model_validate(label) for label in labels]
+
+
+@router.post(
+    "/task-labels",
+    response_model=TaskLabelResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_label_endpoint(
+    request: CreateTaskLabelRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskLabelResponse:
+    try:
+        label = task_queries.create_label(
+            db,
+            current_user.id,
+            name=request.name,
+            color=request.color,
+            team_id=request.team_id,
+        )
+    except TeamNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return TaskLabelResponse.model_validate(label)
+
+
+@router.patch("/task-labels/{label_id}", response_model=TaskLabelResponse)
+def update_label_endpoint(
+    label_id: UUID,
+    request: UpdateTaskLabelRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskLabelResponse:
+    label = task_queries.update_label(
+        db,
+        current_user.id,
+        label_id,
+        request.model_dump(exclude_unset=True),
+        sharing=True,
+    )
+    if label is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Label not found"
+        )
+    return TaskLabelResponse.model_validate(label)
+
+
+@router.delete("/task-labels/{label_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_label_endpoint(
+    label_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    if not task_queries.delete_label(db, current_user.id, label_id, sharing=True):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Label not found"
+        )
+
+
+def _raise_task_ref_errors(exc: Exception) -> None:
+    """Map task-reference validation errors onto HTTP statuses."""
+    if isinstance(
+        exc, (ProjectNotFoundError, LabelNotFoundError, AssigneeNotFoundError)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    if isinstance(exc, ParentTaskError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND
+            if exc.not_found
+            else status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    raise exc
+
+
+@router.get("/tasks", response_model=list[TaskResponse])
+def list_tasks_endpoint(
+    project_id: UUID | None = None,
+    unfiled: bool = False,
+    task_status: TaskStatusLiteral | None = Query(default=None, alias="status"),
+    task_priority: TaskPriorityLiteral | None = Query(default=None, alias="priority"),
+    label_id: Annotated[list[UUID] | None, Query()] = None,
+    created_in_instance_id: UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TaskResponse]:
+    """Same filters as the agent-facing twin: ``unfiled`` selects No-project
+    tasks (exclusive with ``project_id``), ``label_id`` may repeat (AND), and
+    ``created_in_instance_id`` keeps the tasks created in that session (the
+    session page's list)."""
+    if unfiled and project_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pass either project_id or unfiled, not both",
+        )
+    tasks = task_queries.list_tasks(
+        db,
+        current_user.id,
+        project_id=project_id,
+        status=task_status,
+        priority=task_priority,
+        sharing=True,
+        unfiled=unfiled,
+        label_ids=label_id,
+        created_in_instance_id=created_in_instance_id,
+    )
+    return serialize_tasks(db, tasks)
+
+
+@router.post(
+    "/tasks",
+    response_model=TaskResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_task_endpoint(
+    request: CreateTaskRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskResponse:
+    try:
+        task = task_queries.create_task(
+            db,
+            current_user.id,
+            title=request.title,
+            description=request.description,
+            project_id=request.project_id,
+            status=request.status,
+            priority=request.priority,
+            position=request.position,
+            parent_task_id=request.parent_task_id,
+            label_ids=request.label_ids,
+            start_date=request.start_date,
+            due_date=request.due_date,
+            assignee_type=request.assignee_type,
+            assignee_id=request.assignee_id,
+            sharing=True,
+        )
+    except (
+        ProjectNotFoundError,
+        LabelNotFoundError,
+        ParentTaskError,
+        AssigneeNotFoundError,
+    ) as exc:
+        _raise_task_ref_errors(exc)
+        raise  # unreachable; keeps the type checker satisfied
+    return serialize_task(db, task)
+
+
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+def get_task_endpoint(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskResponse:
+    return serialize_task(db, _require_task(db, current_user.id, task_id))
+
+
+@router.get("/tasks/{task_id}/sessions", response_model=list[AgentInstanceResponse])
+def list_task_sessions_endpoint(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AgentInstanceResponse]:
+    """Agent sessions started from this task, most recent first."""
+    task = _require_task(db, current_user.id, task_id)
+    return list_task_instances(db, current_user.id, task.id)
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskResponse)
+def update_task_endpoint(
+    task_id: str,
+    request: UpdateTaskRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskResponse:
+    fields = request.model_dump(exclude_unset=True)
+    existing = _require_task(db, current_user.id, task_id)
+    try:
+        task = task_queries.update_task(
+            db, current_user.id, existing.id, fields, sharing=True
+        )
+    except (
+        ProjectNotFoundError,
+        LabelNotFoundError,
+        ParentTaskError,
+        AssigneeNotFoundError,
+    ) as exc:
+        _raise_task_ref_errors(exc)
+        raise  # unreachable; keeps the type checker satisfied
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+    return serialize_task(db, task)
+
+
+@router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task_endpoint(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    task = _require_task(db, current_user.id, task_id)
+    if not task_queries.delete_task(db, current_user.id, task.id, sharing=True):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task timeline — comments, reactions, activity (collaboration §3.5)
+#
+# There is no WebSocket channel for tasks in this phase, by decision (§9):
+# comments ride refresh-on-focus plus a short SWR interval on an open task.
+# Polling hits this stateless, horizontally scalable app; the relay is pinned to
+# workers=1 and already carries every daemon socket.
+# ---------------------------------------------------------------------------
+
+
+def _require_task(
+    db: Session, user_id: UUID, task_id: str, *, minimum: str = "viewer"
+) -> Task:
+    """The access-scoped resolve every task route starts from.
+
+    Takes the reference as it arrived — a UUID *or* a "VIC-42" identifier, since
+    that is the only handle a person can read off the screen and say out loud.
+
+    It is also what keeps the timeline scoped: those tables carry no `user_id`
+    of their own, so nothing below reaches a comment or activity row except
+    through a task this user can see. `minimum` raises the floor for writes:
+    invisible → 404, visible but below the floor → 403.
+    """
+    task = task_queries.resolve_task(db, user_id, task_id, sharing=True)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+    if minimum != "viewer":
+        access.require(access.task_role(db, user_id, task), minimum)
+    return task
+
+
+@router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
+def get_task_timeline_endpoint(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskTimelineResponse:
+    """Comments and activity together — one round trip, one SWR key."""
+    task = _require_task(db, current_user.id, task_id)
+    return task_timeline_queries.build_timeline(db, task, current_user.id)
+
+
+@router.post(
+    "/tasks/{task_id}/comments",
+    response_model=TaskTimelineResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_task_comment_endpoint(
+    task_id: str,
+    request: CreateTaskCommentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskTimelineResponse:
+    """Post a comment — or a reply to one — and return the whole timeline.
+
+    Returning the timeline rather than the one new comment costs nothing (the
+    caller was about to revalidate anyway) and closes the window where an
+    optimistic append and a background poll disagree about ordering. With
+    threads it also saves the client from having to splice a reply into the
+    right place itself.
+    """
+    task = _require_task(db, current_user.id, task_id, minimum="commenter")
+    try:
+        task_timeline_queries.create_comment(
+            db,
+            task,
+            current_user.id,
+            request.body,
+            parent_comment_id=request.parent_comment_id,
+        )
+    except task_timeline_queries.CommentNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return task_timeline_queries.build_timeline(db, task, current_user.id)
+
+
+@router.patch(
+    "/tasks/{task_id}/comments/{comment_id}", response_model=TaskTimelineResponse
+)
+def update_task_comment_endpoint(
+    task_id: str,
+    comment_id: UUID,
+    request: UpdateTaskCommentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskTimelineResponse:
+    task = _require_task(db, current_user.id, task_id, minimum="commenter")
+    try:
+        task_timeline_queries.update_comment(
+            db, task, comment_id, current_user.id, request.body
+        )
+    except task_timeline_queries.CommentNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return task_timeline_queries.build_timeline(db, task, current_user.id)
+
+
+@router.delete(
+    "/tasks/{task_id}/comments/{comment_id}", response_model=TaskTimelineResponse
+)
+def delete_task_comment_endpoint(
+    task_id: str,
+    comment_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskTimelineResponse:
+    task = _require_task(db, current_user.id, task_id, minimum="commenter")
+    try:
+        task_timeline_queries.delete_comment(db, task, comment_id, current_user.id)
+    except task_timeline_queries.CommentNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return task_timeline_queries.build_timeline(db, task, current_user.id)
+
+
+@router.put("/tasks/{task_id}/reactions", response_model=TaskTimelineResponse)
+def toggle_task_reaction_endpoint(
+    task_id: str,
+    request: ToggleTaskReactionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TaskTimelineResponse:
+    """Add or remove one emoji. PUT, not POST: the operation is idempotent per
+    (user, target, emoji) — clicking twice lands back where it started."""
+    task = _require_task(db, current_user.id, task_id, minimum="commenter")
+    if request.target_type == "task" and request.target_id != task.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_id must be this task",
+        )
+    try:
+        task_timeline_queries.toggle_reaction(
+            db,
+            current_user.id,
+            request.target_type,
+            request.target_id,
+            request.emoji,
+        )
+    except task_timeline_queries.UnknownReactionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported reaction",
+        ) from exc
+    return task_timeline_queries.build_timeline(db, task, current_user.id)

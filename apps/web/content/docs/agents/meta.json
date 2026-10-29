@@ -1,0 +1,11 @@
+{
+  "title": "Agents",
+  "pages": [
+    "index",
+    "claude-code",
+    "codex",
+    "opencode",
+    "more-coding-agents",
+    "custom-agents"
+  ]
+}

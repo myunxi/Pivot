@@ -1,0 +1,243 @@
+/**
+ * The public share-link API (collaboration §3.4, P4): `/api/v1/public/shares/<token>/…`.
+ *
+ * Deliberately not a method on `BackendAPI`: that client always attaches the
+ * browser's bearer, and this surface must work with none. The token in the URL
+ * is the capability. A bearer is added only when the browser happens to have
+ * one — that is how an `authenticated`-audience link tells a signed-in visitor
+ * apart, and how a comment gets attributed to a real account.
+ *
+ * Every failure the server can't distinguish for us (unknown, revoked,
+ * expired, wrong audience, id not covered) arrives as the same 404 and is
+ * surfaced as `ShareNotFoundError` — the viewer renders one honest "not
+ * available" state and never guesses which it was.
+ */
+
+import type {
+  AutomationFrequency,
+  AutomationRunStatus,
+  AutomationScheduleKind,
+  PublicBoardResponse,
+  PublicMessagesPage,
+  PublicSessionStatusFilter,
+  PublicSessionSummary,
+  PublicSessionsPage,
+  PublicShareResponse,
+  TaskTimelineResponse,
+} from '@/lib/backend-api';
+import { getBrowserAccessToken } from '@/lib/auth/browser-token';
+import type { Principal } from '@/lib/principals';
+import { getCloudApiBase, getDesktopConfig } from '@/lib/runtime-config';
+
+/**
+ * An automation as a link viewer sees it: what it asks the agent to do and
+ * when, never who wrote it or where it runs (no author, machine or folder).
+ * `session_config` holds the display keys only (agent, model, effort, mode).
+ */
+export interface PublicAutomation {
+  id: string;
+  title: string;
+  prompt: string;
+  session_config: Record<string, unknown> | null;
+  schedule_kind: AutomationScheduleKind;
+  frequency: AutomationFrequency | null;
+  timezone: string;
+  next_run_at: string | null;
+  enabled: boolean;
+  last_run_at: string | null;
+  last_run_status: AutomationRunStatus | null;
+}
+
+export interface PublicAutomationsResponse {
+  items: PublicAutomation[];
+}
+
+export class ShareNotFoundError extends Error {
+  constructor() {
+    super('Share not found');
+    this.name = 'ShareNotFoundError';
+  }
+}
+
+export class ShareRateLimitedError extends Error {
+  retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super('Too many requests');
+    this.name = 'ShareRateLimitedError';
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+export class ShareRequestError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ShareRequestError';
+    this.status = status;
+  }
+}
+
+function basePath(token: string): string {
+  return `${getCloudApiBase()}/api/v1/public/shares/${encodeURIComponent(token)}`;
+}
+
+/**
+ * The public URL a link is shared as. On the web it is this deployment's own
+ * origin (a self-host shares its own address); the desktop renderer is served
+ * from a loopback port, so it names the web deployment it belongs to instead.
+ */
+export function shareUrl(token: string): string {
+  const desktop = getDesktopConfig();
+  const origin = desktop
+    ? (process.env.NEXT_PUBLIC_VICOA_WEB_URL ?? 'https://vicoa.ai')
+    : typeof window !== 'undefined'
+      ? window.location.origin
+      : (process.env.NEXT_PUBLIC_VICOA_WEB_URL ?? 'https://vicoa.ai');
+  return `${origin.replace(/\/$/, '')}/share/${token}`;
+}
+
+/** The share-scoped attachment URL — no cookie proxy; the token authorizes it. */
+export function publicAttachmentUrl(token: string, attachmentId: string): string {
+  return `${basePath(token)}/attachments/${attachmentId}`;
+}
+
+/**
+ * The share-scoped avatar URL, for `PrincipalAvatarSrcProvider` on a share
+ * page: the dashboard's `/api/users/{id}/avatar` proxy needs the visitor's
+ * cookie, which an anonymous visitor has none of, so every avatar there fell
+ * back to initials. The backend serves only the people the link's page
+ * shows (the owner iff `show_owner`, task assignees/authors, the signed-in
+ * visitor); anyone else 404s and the avatar falls through to its initials.
+ * Same cache-bust as `principalAvatarSrc`. Agent profiles have no public
+ * route yet — a shared session names its agent but does not draw it.
+ */
+export function publicAvatarSrc(token: string, principal: Principal): string | null {
+  if (principal.type !== 'user' || !principal.id || !principal.avatarImageUri) return null;
+  const version = principal.updatedAt ? `?v=${encodeURIComponent(principal.updatedAt)}` : '';
+  return `${basePath(token)}/users/${principal.id}/avatar${version}`;
+}
+
+interface RequestOptions {
+  method?: 'GET' | 'POST';
+  body?: unknown;
+  signal?: AbortSignal;
+  /** A pre-obtained bearer (server components read the cookie session). */
+  accessToken?: string | null;
+}
+
+async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+  const appVersion = process.env.NEXT_PUBLIC_APP_VERSION;
+  if (appVersion) headers['X-Client-Version'] = appVersion;
+  const token =
+    options.accessToken !== undefined
+      ? options.accessToken
+      : typeof window !== 'undefined'
+        ? await getBrowserAccessToken().catch(() => null)
+        : null;
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(url, {
+    method: options.method ?? 'GET',
+    headers,
+    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    signal: options.signal,
+    cache: 'no-store',
+  });
+  if (response.status === 404) throw new ShareNotFoundError();
+  if (response.status === 429) {
+    const retry = Number.parseInt(response.headers.get('retry-after') ?? '5', 10);
+    throw new ShareRateLimitedError(Number.isFinite(retry) ? retry : 5);
+  }
+  if (!response.ok) {
+    let detail = `Request failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === 'string' && body.detail.trim()) detail = body.detail;
+    } catch {
+      // keep the generic message
+    }
+    throw new ShareRequestError(response.status, detail);
+  }
+  return (await response.json()) as T;
+}
+
+export function fetchPublicShare(
+  token: string,
+  options: RequestOptions = {},
+): Promise<PublicShareResponse> {
+  return request<PublicShareResponse>(basePath(token), options);
+}
+
+export function fetchPublicSessions(
+  token: string,
+  params: { limit?: number; offset?: number; status?: PublicSessionStatusFilter | null } = {},
+  options: RequestOptions = {},
+): Promise<PublicSessionsPage> {
+  const query = new URLSearchParams();
+  if (params.limit) query.set('limit', String(params.limit));
+  if (params.offset) query.set('offset', String(params.offset));
+  if (params.status) query.set('status', params.status);
+  const suffix = query.size ? `?${query.toString()}` : '';
+  return request<PublicSessionsPage>(`${basePath(token)}/sessions${suffix}`, options);
+}
+
+export function fetchPublicSession(
+  token: string,
+  instanceId: string,
+  options: RequestOptions = {},
+): Promise<PublicSessionSummary> {
+  return request<PublicSessionSummary>(`${basePath(token)}/sessions/${instanceId}`, options);
+}
+
+export function fetchPublicMessages(
+  token: string,
+  instanceId: string,
+  params: { after?: string; before?: string; limit?: number } = {},
+  options: RequestOptions = {},
+): Promise<PublicMessagesPage> {
+  const query = new URLSearchParams();
+  if (params.after) query.set('after', params.after);
+  if (params.before) query.set('before', params.before);
+  if (params.limit) query.set('limit', String(params.limit));
+  const suffix = query.size ? `?${query.toString()}` : '';
+  return request<PublicMessagesPage>(
+    `${basePath(token)}/sessions/${instanceId}/messages${suffix}`,
+    options,
+  );
+}
+
+export function fetchPublicBoard(
+  token: string,
+  options: RequestOptions = {},
+): Promise<PublicBoardResponse> {
+  return request<PublicBoardResponse>(`${basePath(token)}/board`, options);
+}
+
+/** The automations a project link carries; empty unless it carries `automations`. */
+export function fetchPublicAutomations(
+  token: string,
+  options: RequestOptions = {},
+): Promise<PublicAutomationsResponse> {
+  return request<PublicAutomationsResponse>(`${basePath(token)}/automations`, options);
+}
+
+export function fetchPublicTaskTimeline(
+  token: string,
+  taskId: string,
+  options: RequestOptions = {},
+): Promise<TaskTimelineResponse> {
+  return request<TaskTimelineResponse>(`${basePath(token)}/tasks/${taskId}/timeline`, options);
+}
+
+export function postPublicComment(
+  token: string,
+  taskId: string,
+  data: { body: string; parent_comment_id?: string | null },
+): Promise<TaskTimelineResponse> {
+  return request<TaskTimelineResponse>(`${basePath(token)}/tasks/${taskId}/comments`, {
+    method: 'POST',
+    body: data,
+  });
+}
