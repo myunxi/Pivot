@@ -79,7 +79,11 @@ def wait_for_web(upstream: str, *, timeout: float = 60.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            response = httpx.get(upstream, timeout=1.0, follow_redirects=True)
+            # Loopback health probe: ignore system HTTP proxies the same way the
+            # reverse proxy does, or a proxy can answer/hang for localhost.
+            response = httpx.get(
+                upstream, timeout=1.0, follow_redirects=True, trust_env=False
+            )
             if response.status_code < 500:
                 return True
         except httpx.HTTPError:

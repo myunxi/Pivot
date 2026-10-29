@@ -1541,7 +1541,14 @@ def create_local_app(
             if request.client is not None:
                 headers["x-forwarded-for"] = request.client.host
 
-            client = httpx.AsyncClient(timeout=None)
+            # trust_env=False: a system HTTP proxy (Clash & co.) otherwise
+            # intercepts the loopback upstream request and routes it by the
+            # forwarded Host header, which points back at the daemon — the
+            # request then hangs forever and leaks a socket per page load.
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=60.0, write=60.0, pool=5.0),
+                trust_env=False,
+            )
             try:
                 upstream_request = client.build_request(
                     request.method,
@@ -1557,6 +1564,12 @@ def create_local_app(
                 raise HTTPException(
                     status_code=502, detail="web upstream unavailable"
                 ) from exc
+            except Exception:
+                # A browser that disconnects mid-upload raises Starlette's
+                # ClientDisconnect here, not an httpx error; close the client so
+                # its socket is not leaked.
+                await client.aclose()
+                raise
 
             response_headers = {
                 key: value
