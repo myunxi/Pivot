@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useAgentDashboard } from '@/lib/contexts/agent-dashboard-context';
 import { useDashboardNavigation } from '@/lib/contexts/dashboard-navigation-context';
+import { isCoarsePointer } from '@/lib/pointer';
 import type { AgentProfile, MachineSummary, ReferenceCandidate, TaskResponse, TeamSummary } from '@/lib/backend-api';
 import {
   activeReferences,
@@ -1872,7 +1873,8 @@ function NewSessionContent() {
         return;
       }
     }
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Touch keyboards keep Enter as a newline; sending is the send button's job.
+    if (e.key === 'Enter' && !e.shiftKey && !isCoarsePointer()) {
       e.preventDefault();
       handleSubmit();
     }
@@ -2478,6 +2480,7 @@ function NewSessionContent() {
                   onMentionOpenChange={(open) => { if (open) setShowSlashCommands(false); }}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
+                  enterKeyHint="enter"
                   placeholder="Type messages, @files, #sessions or tasks, /skills or commands"
                   rows={1}
                   disabled={isSubmitting}

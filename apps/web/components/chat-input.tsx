@@ -8,6 +8,7 @@ import { getAttachmentUploadHeaders, getAttachmentUploadUrl } from '@/lib/attach
 import { useMessageDraft } from '@/lib/hooks/use-message-draft';
 import { useSlashCommands } from '@/lib/hooks/use-slash-commands';
 import { MentionTextarea } from '@/components/mention-textarea';
+import { isCoarsePointer } from '@/lib/pointer';
 import type { SlashCommand, AgentType } from '@/lib/constants/slash-commands';
 import { SessionConfigChips } from '@/components/dashboard/session-config-dropdown';
 import { AddToChatMenu } from '@/components/dashboard/add-to-chat-menu';
@@ -778,8 +779,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, ChatInputProps>(functi
       return;
     }
 
-    // Regular enter to send (mention dropdown's Enter is handled inside MentionTextarea)
-    if (e.key === 'Enter' && !e.shiftKey && !showSlashCommands) {
+    // Regular enter to send (mention dropdown's Enter is handled inside
+    // MentionTextarea). Touch keyboards keep Enter as a newline — sending is
+    // the send button's job there.
+    if (e.key === 'Enter' && !e.shiftKey && !showSlashCommands && !isCoarsePointer()) {
       e.preventDefault();
       handleSendMessage();
     }
@@ -970,6 +973,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, ChatInputProps>(functi
             referenceExcludeSessionId={instanceId}
             onReferencePick={handleReferencePick}
             onMentionOpenChange={handleMentionOpenChange}
+            enterKeyHint="enter"
             placeholder={effectivePlaceholder}
             disabled={disabled || !canSendMessage || isSending}
             openMentionSignal={mentionSignal}
