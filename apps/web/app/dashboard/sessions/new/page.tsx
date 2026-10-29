@@ -19,10 +19,12 @@ import {
   Folder,
   Link2,
   ListTodo,
+  Menu,
   Monitor,
   X,
 } from 'lucide-react';
 import { useAgentDashboard } from '@/lib/contexts/agent-dashboard-context';
+import { useDashboardNavigation } from '@/lib/contexts/dashboard-navigation-context';
 import type { AgentProfile, MachineSummary, ReferenceCandidate, TaskResponse, TeamSummary } from '@/lib/backend-api';
 import {
   activeReferences,
@@ -126,10 +128,14 @@ import { FolderRefChip } from '@/components/folder-ref-chip';
 import { ForkContextChip } from '@/components/dashboard/fork-context-chip';
 import { postInstanceMessage } from '@/lib/agent-instance-api';
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES, type ChatUploadedAttachment } from '@/components/chat-input';
+import { getAttachmentUploadHeaders, getAttachmentUploadUrl } from '@/lib/attachment-url';
 import { formatFileSize } from '@/components/chat-attachments';
 import { GitBranch, File as FileIcon, FolderPlus } from 'lucide-react';
 
 const MACHINE_REFRESH_INTERVAL_MS = 30_000;
+
+// Direct mode has no cloud task list, so the task picker is hidden.
+const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1';
 
 const EMPTY_AGENT_MODELS_CACHE: MachineAgentModelsCache = { models: {}, modes: {} };
 
@@ -204,7 +210,11 @@ async function uploadImageAttachment(instanceId: string, file: File): Promise<st
     const formData = new FormData();
     formData.append('agent_instance_id', instanceId);
     formData.append('file', file);
-    const response = await fetch('/api/attachments', { method: 'POST', body: formData });
+    const response = await fetch(getAttachmentUploadUrl(), {
+      method: 'POST',
+      body: formData,
+      headers: getAttachmentUploadHeaders(),
+    });
     if (!response.ok) throw new Error(`upload failed (${response.status})`);
     const meta = (await response.json()) as ChatUploadedAttachment;
     return meta.id;
@@ -341,6 +351,10 @@ function readWorktreePreselect(params: URLSearchParams): PendingWorktreePreselec
 function NewSessionContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  // This route is the mobile landing page, so it needs the same sidebar
+  // trigger the chat page has — the shared dashboard top bar (which carries
+  // one) is hidden on every /dashboard/sessions/* route.
+  const { openSidebar } = useDashboardNavigation();
   // `?directory=` preselects the project folder (the sidebar's per-project "+").
   // Held in a ref and consumed once, so a later machine reload falls back to
   // that machine's own default instead of snapping back to the link's folder.
@@ -2111,6 +2125,18 @@ function NewSessionContent() {
           with NO_DRAG. */}
       <div style={DRAG_REGION} className="flex items-center justify-between pl-2 xl:pl-6 pr-2 py-2 flex-shrink-0">
         <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            style={NO_DRAG}
+            className="xl:hidden h-8 w-8 flex-shrink-0"
+            onClick={openSidebar}
+            title="Open sidebar"
+          >
+            <Menu className="h-5 w-5" />
+            <span className="sr-only">Open sidebar</span>
+          </Button>
           <DesktopCollapsedLead />
           <h1 className="text-sm font-normal font-mono text-muted-foreground">New Session</h1>
         </div>
@@ -2151,7 +2177,7 @@ function NewSessionContent() {
       </div>
 
       {/* Chat-style input pinned to bottom */}
-      <div className="flex-shrink-0 p-4">
+      <div className="vicoa-direct-composer flex-shrink-0 p-4">
         <div className="max-w-4xl mx-auto">
           {/* Why the composer can't submit, immediately above the machine chip it
               is usually about. It used to sit at the top of the scrolling pane,
@@ -2293,32 +2319,34 @@ function NewSessionContent() {
               </WorktreePickerPopover>
             )}
 
-            <TaskPickerPopover
-              selectedTask={selectedTask}
-              onSelect={handleTaskChange}
-              disabled={!api}
-            >
-              <button
-                type="button"
-                title={selectedTask ? selectedTask.title : 'Seed this session from a task'}
-                className={SETUP_CHIP_CLASS}
+            {!IS_DIRECT_WEB && (
+              <TaskPickerPopover
+                selectedTask={selectedTask}
+                onSelect={handleTaskChange}
                 disabled={!api}
               >
-                <ListTodo className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                <span className={`max-w-36 truncate ${selectedTask ? '' : 'text-muted-foreground/60'}`}>
-                  {selectedTask ? selectedTask.title : 'Choose task'}
-                </span>
-                {selectedTask && (
-                  <X
-                    className="h-3 w-3 flex-shrink-0 text-muted-foreground hover:text-foreground"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleTaskChange(null);
-                    }}
-                  />
-                )}
-              </button>
-            </TaskPickerPopover>
+                <button
+                  type="button"
+                  title={selectedTask ? selectedTask.title : 'Seed this session from a task'}
+                  className={SETUP_CHIP_CLASS}
+                  disabled={!api}
+                >
+                  <ListTodo className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                  <span className={`max-w-36 truncate ${selectedTask ? '' : 'text-muted-foreground/60'}`}>
+                    {selectedTask ? selectedTask.title : 'Choose task'}
+                  </span>
+                  {selectedTask && (
+                    <X
+                      className="h-3 w-3 flex-shrink-0 text-muted-foreground hover:text-foreground"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleTaskChange(null);
+                      }}
+                    />
+                  )}
+                </button>
+              </TaskPickerPopover>
+            )}
           </div>
 
           <div ref={promptContainerRef} className="w-full bg-composer border border-border/50 rounded-3xl px-4 py-3 relative font-mono flex gap-3 shadow-sm">

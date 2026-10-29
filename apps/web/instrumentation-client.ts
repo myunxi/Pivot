@@ -2,6 +2,7 @@ import posthog from 'posthog-js'
 import { registerSuperProperties } from '@/lib/desktop-telemetry'
 
 const posthogToken = process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN
+const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1'
 
 // Guard the init on a present token. NEXT_PUBLIC_* values are inlined at
 // `next build` time, so a build that doesn't have the token in its env (e.g. a
@@ -9,7 +10,7 @@ const posthogToken = process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN
 // otherwise call posthog.init('') and log "PostHog was initialized without a
 // token" on every launch. When the token is absent we skip init entirely;
 // capture()/identify() elsewhere already no-op while PostHog is uninitialized.
-if (posthogToken) {
+if (posthogToken && !IS_DIRECT_WEB) {
   posthog.init(posthogToken, {
     api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
     defaults: '2026-01-30',

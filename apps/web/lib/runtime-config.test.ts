@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getDesktopTelemetryConfig, getDesktopWindowChrome } from './runtime-config';
+import {
+  getDesktopTelemetryConfig,
+  getDesktopWindowChrome,
+  isDesktopShell,
+  isDirectWeb,
+} from './runtime-config';
 
 /** Stub the preload-injected globals for one assertion. */
 function stubWindow(injected: Record<string, unknown>) {
@@ -43,6 +48,42 @@ describe('getDesktopWindowChrome', () => {
   it('is the macOS shape on plain web (no platform signal)', () => {
     stubWindow({});
     expect(getDesktopWindowChrome()).toBe('mac');
+  });
+});
+
+describe('direct web detection', () => {
+  it('recognizes the browser direct-mode injection', () => {
+    stubWindow({
+      __VICOA_DESKTOP__: {
+        mode: 'local',
+        client: 'web',
+        direct: true,
+        wsUrl: 'ws://127.0.0.1:8765/ws',
+        apiBase: 'http://127.0.0.1:8765',
+        token: 'direct-token',
+      },
+    });
+    expect(isDirectWeb()).toBe(true);
+    expect(isDesktopShell()).toBe(false);
+  });
+
+  it('treats an Electron injection as a desktop shell', () => {
+    stubWindow({
+      __VICOA_DESKTOP__: {
+        mode: 'local',
+        wsUrl: 'ws://127.0.0.1:43118/ws',
+        apiBase: 'http://127.0.0.1:43118',
+        token: 'nonce',
+      },
+    });
+    expect(isDirectWeb()).toBe(false);
+    expect(isDesktopShell()).toBe(true);
+  });
+
+  it('is false on plain web / SSR', () => {
+    stubWindow({});
+    expect(isDirectWeb()).toBe(false);
+    expect(isDesktopShell()).toBe(false);
   });
 });
 

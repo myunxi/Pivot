@@ -10,6 +10,33 @@ import { PostHogIdentify } from '@/components/posthog-identify';
 import { DesktopAuthGate } from '@/components/dashboard/desktop-auth-gate';
 import { DesktopAuthHandoff } from '@/components/dashboard/desktop-auth-handoff';
 import { DesktopWindowControls } from '@/components/desktop/window-chrome';
+import { DirectPairingGate } from '@/components/direct/direct-pairing-gate';
+import { DirectPwa } from '@/components/direct/direct-pwa';
+import {
+  DIRECT_API_BASE_KEY,
+  DIRECT_TOKEN_KEY,
+  DIRECT_WS_URL_KEY,
+} from '@/lib/direct-pairing';
+
+// Desktop builds run their own local Next server with this flag set. As a
+// compile-time constant it is identical on server and client, so it can gate
+// desktop-only chrome below without a hydration mismatch.
+const IS_DESKTOP = process.env.NEXT_PUBLIC_VICOA_DESKTOP === '1';
+
+// Browser direct mode: the page itself injects the same runtime config the
+// Electron preload normally provides. These are compile-time values, so a
+// change requires a rebuild.
+const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1';
+const DIRECT_API_BASE = process.env.NEXT_PUBLIC_DIRECT_API_BASE ?? '';
+const DIRECT_WS_URL = process.env.NEXT_PUBLIC_DIRECT_WS_URL ?? '';
+
+const DIRECT_APPLE_WEB_APP = {
+  capable: true,
+  title: 'Vicoa',
+  // Matches the dark app; with viewport-fit auto the page no longer paints
+  // under the status bar, so an opaque bar keeps the top edge consistent.
+  statusBarStyle: 'black',
+} as const;
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://vicoa.ai'),
@@ -108,6 +135,7 @@ export const metadata: Metadata = {
   category: 'technology',
   classification: 'Developer Tools',
   applicationName: 'Vicoa',
+  ...(IS_DIRECT_WEB ? { appleWebApp: DIRECT_APPLE_WEB_APP } : {}),
   referrer: 'origin-when-cross-origin',
   formatDetection: {
     email: false,
@@ -116,6 +144,7 @@ export const metadata: Metadata = {
   },
   other: {
     'apple-itunes-app': 'app-id=6751626168',
+    ...(IS_DIRECT_WEB ? { 'apple-mobile-web-app-capable': 'yes' } : {}),
   },
 };
 
@@ -124,16 +153,49 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  // `cover` makes iOS standalone shrink the layout viewport by the status bar
+  // height without moving its origin, leaving an unpaintable strip at the
+  // bottom. Let iOS lay the app out inside the safe area instead.
+  viewportFit: IS_DIRECT_WEB ? 'auto' : 'cover',
   themeColor: [
     { media: '(prefers-color-scheme: light)', color: '#ffffff' },
     { media: '(prefers-color-scheme: dark)', color: '#1a1a1a' }
   ]
 };
 
-// Desktop builds run their own local Next server with this flag set. As a
-// compile-time constant it is identical on server and client, so it can gate
-// desktop-only chrome below without a hydration mismatch.
-const IS_DESKTOP = process.env.NEXT_PUBLIC_VICOA_DESKTOP === '1';
+function jsString(value: string): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+function directRuntimeConfigScript(): string {
+  return `(function(){
+var TOKEN_KEY=${jsString(DIRECT_TOKEN_KEY)};
+var API_KEY=${jsString(DIRECT_API_BASE_KEY)};
+var WS_KEY=${jsString(DIRECT_WS_URL_KEY)};
+var token='',apiBase='',wsUrl='',pairToken='';
+try{
+  var hash=window.location.hash||'';
+  var match=hash.match(/[#&]token=([^&#]+)/);
+  if(match){
+    pairToken=decodeURIComponent(match[1]);
+    token=pairToken;
+    try{localStorage.setItem(TOKEN_KEY,token);}catch(e){}
+    try{history.replaceState(null,'',window.location.pathname+window.location.search);}catch(e){}
+  }else{
+    try{token=localStorage.getItem(TOKEN_KEY)||'';}catch(e){}
+  }
+  try{apiBase=localStorage.getItem(API_KEY)||'';}catch(e){}
+  try{wsUrl=localStorage.getItem(WS_KEY)||'';}catch(e){}
+}catch(e){}
+var proto=window.location.protocol==='https:'?'wss:':'ws:';
+window.__VICOA_DESKTOP__={mode:'local',client:'web',direct:true,apiBase:${jsString(DIRECT_API_BASE)}||apiBase||window.location.origin,wsUrl:${jsString(DIRECT_WS_URL)}||wsUrl||proto+'//'+window.location.host+'/ws',token:token};
+var path=window.location.pathname;
+var onDashboard=path==='/dashboard'||path.indexOf('/dashboard/')===0;
+if(pairToken){window.location.replace('/dashboard');}
+else if(!token&&(path==='/'||onDashboard)){window.location.replace('/direct-pair');}
+else if(token&&path==='/'){window.location.replace('/dashboard');}
+})();`;
+}
 
 export default function RootLayout({
   children
@@ -159,18 +221,27 @@ export default function RootLayout({
             __html: `(function(){try{var t=localStorage.getItem('ui-theme')||'dark';var c='dark';if(t==='light')c='light';else if(t==='system')c=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';else if(t.indexOf('plugin:')===0)c='dark';var e=document.documentElement;e.classList.remove('light','dark');e.classList.add(c);}catch(e){}})();`,
           }}
         />
-        <Script
-          src="https://www.googletagmanager.com/gtag/js?id=G-EWZH9BN2RK"
-          strategy="lazyOnload"
-        />
-        <Script id="gtag-init" strategy="lazyOnload">
-          {`
+        {IS_DIRECT_WEB && (
+          <script
+            dangerouslySetInnerHTML={{ __html: directRuntimeConfigScript() }}
+          />
+        )}
+        {!IS_DIRECT_WEB && (
+          <>
+            <Script
+              src="https://www.googletagmanager.com/gtag/js?id=G-EWZH9BN2RK"
+              strategy="lazyOnload"
+            />
+            <Script id="gtag-init" strategy="lazyOnload">
+              {`
             window.dataLayer = window.dataLayer || [];
             function gtag(){dataLayer.push(arguments);}
             gtag('js', new Date());
             gtag('config', 'G-EWZH9BN2RK');
           `}
-        </Script>
+            </Script>
+          </>
+        )}
       </head>
       <body 
         className="min-h-[100dvh] bg-background text-foreground"
@@ -219,7 +290,9 @@ export default function RootLayout({
             })
           }}
         />
-        <PostHogIdentify />
+        {IS_DIRECT_WEB ? <DirectPairingGate /> : null}
+        {IS_DIRECT_WEB ? <DirectPwa /> : null}
+        {!IS_DIRECT_WEB ? <PostHogIdentify /> : null}
         <ThemeProvider defaultTheme="dark">
           {/* Injects token overrides for the active plugin theme (Tier 1); renders
               nothing for the built-in dark/light/system themes. */}

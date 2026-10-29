@@ -3,6 +3,7 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
 import { File as FileIcon } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { getAttachmentUrl } from '@/lib/attachment-url';
 
 /** Shape of one entry in message_metadata.attachments (stamped by the backend). */
 export interface ChatAttachmentMeta {
@@ -48,7 +49,7 @@ export function formatFileSize(bytes: number): string {
 type AttachmentUrlResolver = (attachmentId: string) => string;
 
 /** The dashboard default: the cookie-authenticated same-origin proxy. */
-const defaultAttachmentUrl: AttachmentUrlResolver = (id) => `/api/attachments/${id}`;
+const defaultAttachmentUrl: AttachmentUrlResolver = (id) => getAttachmentUrl(id);
 
 const AttachmentUrlContext = createContext<AttachmentUrlResolver>(defaultAttachmentUrl);
 

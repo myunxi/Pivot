@@ -24,6 +24,10 @@ export interface DesktopRuntimeConfig {
   wsUrl: string;
   apiBase: string;
   token: string;
+  /** Who injected the config: the Electron preload or the direct-mode page. */
+  client?: 'desktop' | 'web';
+  /** True when the browser is talking straight to a local direct-mode daemon. */
+  direct?: boolean;
   /**
    * Self-hosted cloud endpoints, injected when the user pointed the desktop app
    * at their own backend (env `VICOA_API_URL`/`VICOA_WS_URL` or
@@ -108,6 +112,21 @@ export function getDesktopTelemetryConfig(): DesktopTelemetryConfig | null {
 /** True only in logged-out desktop mode (everything served by the local daemon). */
 export function isDesktopLocal(): boolean {
   return getDesktopConfig()?.mode === 'local';
+}
+
+/** True only when the browser was configured for direct mode by the page itself. */
+export function isDirectWeb(): boolean {
+  return getDesktopConfig()?.direct === true;
+}
+
+/**
+ * True when an Electron preload injected the config. Direct web is deliberately
+ * excluded so Electron-only surfaces (window chrome, auth handoff) stay off in
+ * a normal browser.
+ */
+export function isDesktopShell(): boolean {
+  const config = getDesktopConfig();
+  return config !== null && config.client !== 'web';
 }
 
 /**

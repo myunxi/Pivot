@@ -9,10 +9,25 @@
  * self-hosted build run with no Supabase project configured at all.
  */
 
+import { getDesktopConfig } from '@/lib/runtime-config';
 import { isBuiltinAuth } from './auth-provider';
 import { getBuiltinClaims, getBuiltinToken } from './builtin-client';
 
+/**
+ * The synthetic identity direct mode reports everywhere. The id matches the
+ * local daemon's `LOCAL_USER_ID` (uuid5 of "vicoa-local-user").
+ */
+export const DIRECT_IDENTITY: BrowserIdentity = {
+  id: '88c01271-bc99-5497-9359-9c9dbae1e104',
+  email: 'local@vicoa.direct',
+  display_name: 'Local User',
+};
+
 export async function getBrowserAccessToken(): Promise<string | null> {
+  const direct = getDesktopConfig();
+  if (direct?.direct) {
+    return direct.token || null;
+  }
   if (isBuiltinAuth()) {
     return getBuiltinToken();
   }
@@ -36,6 +51,9 @@ export type BrowserIdentity = {
 };
 
 export async function readBrowserIdentity(): Promise<BrowserIdentity | null> {
+  if (getDesktopConfig()?.direct) {
+    return DIRECT_IDENTITY;
+  }
   if (isBuiltinAuth()) {
     const claims = getBuiltinClaims();
     return claims

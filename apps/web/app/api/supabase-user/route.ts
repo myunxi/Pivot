@@ -51,6 +51,23 @@ async function fetchBackendProfile(): Promise<{
 }
 
 export async function GET() {
+  // Direct mode has no identity provider; report the same synthetic user the
+  // local daemon returns from /api/v1/auth/me.
+  if (
+    process.env.NEXT_PUBLIC_VICOA_DIRECT === '1' ||
+    process.env.VICOA_DIRECT === '1'
+  ) {
+    return NextResponse.json({
+      id: '88c01271-bc99-5497-9359-9c9dbae1e104',
+      name: 'Local User',
+      email: 'local@vicoa.direct',
+      role: 'member',
+      avatarImageUri: null,
+      avatarEmoji: null,
+      updatedAt: null,
+    });
+  }
+
   try {
     if (isBuiltinAuth()) {
       // No profile table to consult — the session token already carries the

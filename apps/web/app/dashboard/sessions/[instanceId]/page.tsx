@@ -2902,7 +2902,7 @@ function AgentInstanceContent() {
       })()} */}
 
       {/* Fixed Chat Input at Bottom */}
-      <div className="flex-shrink-0 bg-muted/10">
+      <div className="vicoa-direct-composer flex-shrink-0 bg-muted/10">
         <div className="p-4">
           <div className="max-w-4xl mx-auto">
             {instance.status !== 'COMPLETED' && permissionModeError && (

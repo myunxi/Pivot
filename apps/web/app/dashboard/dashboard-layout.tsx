@@ -24,6 +24,7 @@ import {
   BookOpen,
   Bot,
   Layers2,
+  Link2,
   X,
   Plus,
   Sidebar,
@@ -84,6 +85,10 @@ const fetcher = (url: string) => fetch(url).then((res) => {
 // state (local vs cloud mode) still comes from lib/runtime-config.ts inside
 // the desktop components.
 const IS_DESKTOP = process.env.NEXT_PUBLIC_VICOA_DESKTOP === '1';
+
+// Browser direct mode: hide cloud-only navigation, search, onboarding and
+// account-menu entries. Compile-time, so server and client agree.
+const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1';
 
 const SIDEBAR_MIN_WIDTH = 180;
 const SIDEBAR_MAX_WIDTH = 600;
@@ -403,7 +408,7 @@ function DashboardSidebar({
 
           {/* Kanban lives in the Workspaces row (shared list) when expanded; the
               collapsed rail keeps a quick-access icon for it. */}
-          {!showSideBar && (
+          {!IS_DIRECT_WEB && !showSideBar && (
             <Button
               variant="subtle"
               size="icon"
@@ -417,7 +422,7 @@ function DashboardSidebar({
           )}
 
           {/* Human task backlog — distinct from Kanban (agent sessions). */}
-          {!hiddenNav.has('tasks') && (
+          {!IS_DIRECT_WEB && !hiddenNav.has('tasks') && (
             <Button
               variant="subtle"
               className={cn(
@@ -435,7 +440,7 @@ function DashboardSidebar({
           )}
 
           {/* Scheduled agent runs. */}
-          {!hiddenNav.has('automations') && (
+          {!IS_DIRECT_WEB && !hiddenNav.has('automations') && (
             <Button
               variant="subtle"
               className={cn(
@@ -454,7 +459,7 @@ function DashboardSidebar({
 
           {/* Saved agent presets (provider + model + instructions). Distinct
               from the session list below, which is what those agents are doing. */}
-          {!hiddenNav.has('agents') && (
+          {!IS_DIRECT_WEB && !hiddenNav.has('agents') && (
             <Button
               variant="subtle"
               className={cn(
@@ -472,7 +477,7 @@ function DashboardSidebar({
           )}
 
           {/* Agent skills installed per machine. */}
-          {!hiddenNav.has('skills') && (
+          {!IS_DIRECT_WEB && !hiddenNav.has('skills') && (
             <Button
               variant="subtle"
               className={cn(
@@ -497,7 +502,7 @@ function DashboardSidebar({
           />
 
           {/* Workspace search across sessions, tasks, automations (also ⌘K). */}
-          {!hiddenNav.has('search') && (
+          {!IS_DIRECT_WEB && !hiddenNav.has('search') && (
             <Button
               variant="subtle"
               className={cn(
@@ -550,7 +555,7 @@ function DashboardSidebar({
 
         {/* Onboarding guide — floats just above the account row. Hidden in the
             collapsed rail; the component itself hides when signed-out. */}
-        {showSideBar && (
+        {!IS_DIRECT_WEB && showSideBar && (
           <div className="shrink-0 px-2 pb-2 pt-1">
             <SetupChecklist />
           </div>
@@ -618,27 +623,33 @@ function DashboardSidebar({
                   </div>
                 </div>
 
-                <AccountPlanItem subscription={billingSubscription} className="mx-2 mt-2" />
+                {!IS_DIRECT_WEB && (
+                  <AccountPlanItem subscription={billingSubscription} className="mx-2 mt-2" />
+                )}
 
-                <div className="py-1">
-                  <AccountMenuInvitations
-                    itemClassName="px-4 py-2.5 text-xs text-foreground/80"
-                    rowClassName="px-4"
-                  />
-                </div>
+                {!IS_DIRECT_WEB && (
+                  <div className="py-1">
+                    <AccountMenuInvitations
+                      itemClassName="px-4 py-2.5 text-xs text-foreground/80"
+                      rowClassName="px-4"
+                    />
+                  </div>
+                )}
 
                 <DropdownMenuSeparator className="mx-4" />
 
                 <div className="py-1">
-                  <DropdownMenuItem
-                    asChild
-                    className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
-                  >
-                    <Link href="/dashboard/settings" className="flex w-full items-center gap-2">
-                      <Cog className="h-4 w-4" />
-                      <span>Settings</span>
-                    </Link>
-                  </DropdownMenuItem>
+                  {!IS_DIRECT_WEB && (
+                    <DropdownMenuItem
+                      asChild
+                      className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
+                    >
+                      <Link href="/dashboard/settings" className="flex w-full items-center gap-2">
+                        <Cog className="h-4 w-4" />
+                        <span>Settings</span>
+                      </Link>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     asChild
                     className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
@@ -648,13 +659,26 @@ function DashboardSidebar({
                       <div className="flex-1">Documentation</div>
                     </Link>
                   </DropdownMenuItem>
-                  <DropdownMenuItem
-                    className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
-                    onSelect={() => onReportIssue()}
-                  >
-                    <Flag className="h-4 w-4" />
-                    <span>Report an issue</span>
-                  </DropdownMenuItem>
+                  {IS_DIRECT_WEB && (
+                    <DropdownMenuItem
+                      asChild
+                      className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
+                    >
+                      <Link href="/direct-pair" className="flex w-full items-center gap-2">
+                        <Link2 className="h-4 w-4" />
+                        <span>Connection</span>
+                      </Link>
+                    </DropdownMenuItem>
+                  )}
+                  {!IS_DIRECT_WEB && (
+                    <DropdownMenuItem
+                      className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
+                      onSelect={() => onReportIssue()}
+                    >
+                      <Flag className="h-4 w-4" />
+                      <span>Report an issue</span>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     asChild
                     className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
@@ -671,37 +695,41 @@ function DashboardSidebar({
                   </DropdownMenuItem>
                 </div>
 
-                <DropdownMenuSeparator className="mx-4" />
+                {!IS_DIRECT_WEB && (
+                  <>
+                    <DropdownMenuSeparator className="mx-4" />
 
-                <div className="py-1">
-                  <DropdownMenuItem
-                    asChild
-                    className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80">
-                    <Link href="/dashboard/api-keys" className="flex w-full items-center gap-2">
-                      <Key className="h-4 w-4" />
-                      API Keys
-                    </Link>
-                  </DropdownMenuItem>
+                    <div className="py-1">
+                      <DropdownMenuItem
+                        asChild
+                        className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80">
+                        <Link href="/dashboard/api-keys" className="flex w-full items-center gap-2">
+                          <Key className="h-4 w-4" />
+                          API Keys
+                        </Link>
+                      </DropdownMenuItem>
 
-                  <DropdownMenuItem
-                    className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
-                    onSelect={async () => {
-                      // Handle logout
-                      const { signOutBrowser } = await import('@/lib/auth/sign-out');
-                      await signOutBrowser();
-                      window.location.href = '/';
-                    }}
-                  >
-                    <LogOut className="h-4 w-4" />
-                    <span>Log out</span>
-                  </DropdownMenuItem>
-                </div>
+                      <DropdownMenuItem
+                        className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
+                        onSelect={async () => {
+                          // Handle logout
+                          const { signOutBrowser } = await import('@/lib/auth/sign-out');
+                          await signOutBrowser();
+                          window.location.href = '/';
+                        }}
+                      >
+                        <LogOut className="h-4 w-4" />
+                        <span>Log out</span>
+                      </DropdownMenuItem>
+                    </div>
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
             </div>
             {/* Settings shortcut beside the avatar — straight to the page,
                 skipping the account menu (session ask). Expanded rail only. */}
-            {showSideBar && (
+            {!IS_DIRECT_WEB && showSideBar && (
               <Link
                 href="/dashboard/settings"
                 title="Settings"
@@ -875,6 +903,7 @@ function DashboardShell({
   // ⌘K toggles the workspace search palette (web + desktop; rebindable).
   // Capture phase so it wins over focused inputs, like the ⌘, handler.
   useEffect(() => {
+    if (IS_DIRECT_WEB) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!matchesShortcut(event, 'open-search')) return;
       event.preventDefault();
@@ -889,9 +918,9 @@ function DashboardShell({
 
   return (
     <>
-      <div className="flex h-screen max-w-full overflow-hidden">
+      <div className={cn('flex h-screen max-w-full overflow-hidden', IS_DIRECT_WEB && 'vicoa-direct-shell')}>
         {!isInstancePage && !IS_DESKTOP && (
-          <div className="xl:hidden fixed top-0 left-0 right-0 z-40 flex items-center justify-between bg-background/400 p-4">
+          <div className={cn('xl:hidden fixed top-0 left-0 right-0 z-40 flex items-center justify-between bg-background/400 p-4', IS_DIRECT_WEB && 'vicoa-direct-topbar')}>
             <div className="flex items-center">
               <Button
                 type="button"
@@ -984,15 +1013,17 @@ function DashboardShell({
         onSessionRequested={refreshData}
       />
 
-      <ReportIssueDialog
-        open={reportIssueOpen}
-        onOpenChange={setReportIssueOpen}
-        userEmail={shellUserEmail}
-      />
+      {!IS_DIRECT_WEB && (
+        <ReportIssueDialog
+          open={reportIssueOpen}
+          onOpenChange={setReportIssueOpen}
+          userEmail={shellUserEmail}
+        />
+      )}
 
-      <SearchPalette open={searchOpen} onOpenChange={setSearchOpen} />
+      {!IS_DIRECT_WEB && <SearchPalette open={searchOpen} onOpenChange={setSearchOpen} />}
 
-      <UpgradeDialog />
+      {!IS_DIRECT_WEB && <UpgradeDialog />}
     </>
   );
 }
@@ -1110,7 +1141,7 @@ export default function DashboardLayout({
         {/* Terminal panes must outlive route changes (session switches), so
             their keep-alive provider wraps the whole dashboard shell. */}
         <TerminalSessionsProvider>
-        <OnboardingModal />
+        {!IS_DIRECT_WEB && <OnboardingModal />}
         {/* Plugin system (Tier 1): keep the registry in sync with each machine's
             daemon, and surface the first-load trust prompt for new plugins. */}
         <PluginCatalogSync />

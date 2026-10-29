@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { createClient } from '@/lib/auth/supabase-middleware';
 import { decodeBuiltinToken, isBuiltinAuth, BUILTIN_SESSION_COOKIE } from '@/lib/auth/auth-provider';
+import { DIRECT_FALLBACK_PATH, isDirectCloudPath } from '@/lib/direct-mode-routes';
 
 const protectedRoutes = '/dashboard';
 
@@ -29,6 +30,22 @@ function builtinMiddleware(request: NextRequest, isProtectedRoute: boolean) {
 }
 
 export async function middleware(request: NextRequest) {
+  // Browser direct mode has no cloud session: the local daemon authenticates
+  // every API call with the injected token, so the dashboard must load without
+  // a sign-in redirect. Cloud-only pages and the dashboard home redirect to
+  // New Session.
+  if (process.env.NEXT_PUBLIC_VICOA_DIRECT === '1') {
+    const { pathname } = request.nextUrl;
+    if (
+      pathname === '/dashboard' ||
+      pathname === '/dashboard/' ||
+      isDirectCloudPath(pathname)
+    ) {
+      return NextResponse.redirect(new URL(DIRECT_FALLBACK_PATH, request.url));
+    }
+    return NextResponse.next();
+  }
+
   // Desktop builds serve the renderer from their own local Next server; local
   // (logged-out) mode must reach /dashboard, so skip the auth redirect.
   if (process.env.NEXT_PUBLIC_VICOA_DESKTOP === '1') {

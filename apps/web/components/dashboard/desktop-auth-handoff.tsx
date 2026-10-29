@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { Loader2 } from 'lucide-react';
 import { createClient } from '@/lib/auth/supabase-client';
-import { getDesktopConfig } from '@/lib/runtime-config';
+import { getDesktopConfig, isDesktopShell } from '@/lib/runtime-config';
 import { CliKeyMintError, getDesktopAuthBridge, mintCliKey } from '@/lib/desktop-auth';
 
 type HandoffState =
@@ -34,7 +34,7 @@ export function DesktopAuthHandoff() {
 
   const attempt = useCallback(async () => {
     const config = getDesktopConfig();
-    if (!config || config.mode !== 'local') return;
+    if (!config || config.mode !== 'local' || !isDesktopShell()) return;
     // The browser-handoff screen performs its own setSession + setApiKey.
     if (pathname === '/desktop-signin') return;
     const bridge = getDesktopAuthBridge();
@@ -83,7 +83,7 @@ export function DesktopAuthHandoff() {
 
   useEffect(() => {
     const config = getDesktopConfig();
-    if (!config || config.mode !== 'local') return;
+    if (!config || config.mode !== 'local' || !isDesktopShell()) return;
 
     void attempt();
 

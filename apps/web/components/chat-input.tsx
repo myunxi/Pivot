@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect, useMemo, memo, forwardRef, us
 import { Button } from '@/components/ui/button';
 import { RefreshCw, ArrowUp, Square, X, File as FileIcon, Link2 } from 'lucide-react';
 import { formatFileSize } from '@/components/chat-attachments';
+import { getAttachmentUploadHeaders, getAttachmentUploadUrl } from '@/lib/attachment-url';
 import { useMessageDraft } from '@/lib/hooks/use-message-draft';
 import { useSlashCommands } from '@/lib/hooks/use-slash-commands';
 import { MentionTextarea } from '@/components/mention-textarea';
@@ -334,7 +335,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, ChatInputProps>(functi
       const formData = new FormData();
       formData.append('agent_instance_id', instanceId);
       formData.append('file', file);
-      const response = await fetch('/api/attachments', { method: 'POST', body: formData });
+      const response = await fetch(getAttachmentUploadUrl(), {
+        method: 'POST',
+        body: formData,
+        headers: getAttachmentUploadHeaders(),
+      });
       if (!response.ok) throw new Error(`upload failed (${response.status})`);
       const meta = (await response.json()) as ChatUploadedAttachment;
       setPendingUploads(prev => prev.map(u =>

@@ -792,3 +792,42 @@ html .font-mono {
   scrollbar-width: thin;
   scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
 }
+
+/* Installed direct-mode PWA. Direct builds use `viewport-fit=auto`: iOS 26
+   standalone with `cover` shrinks the layout viewport by the status-bar height
+   while keeping its origin at the top, so the bottom strip can never be painted
+   (on-device probe: innerHeight 894 of 956, env 62/34). With auto, iOS lays the
+   app out inside the safe area and the env insets report 0; the rules below are
+   no-ops there and a safety net for modes that still report insets. */
+@media (display-mode: standalone) {
+  .vicoa-direct-shell {
+    position: fixed;
+    inset: 0;
+    height: auto;
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .vicoa-direct-shell > aside {
+    top: env(safe-area-inset-top);
+    bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .vicoa-direct-shell .vicoa-direct-topbar {
+    top: env(safe-area-inset-top);
+  }
+
+  /* Paint the composer surface through the home-indicator inset instead of
+     leaving the page background exposed below it. */
+  .vicoa-direct-shell .vicoa-direct-composer {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .vicoa-direct-page {
+    min-height: 100vh;
+    padding-top: max(1.5rem, env(safe-area-inset-top));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+  }
+}

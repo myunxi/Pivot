@@ -126,6 +126,10 @@ import type { PrInfo } from '@/components/dashboard/pr-status';
 // Selected-row highlight for session rows (filter-menu.tsx carries its own copy).
 const ITEM_SELECTED = 'bg-foreground/[0.08] dark:bg-foreground/10 text-foreground';
 
+// Direct mode has no Kanban board; keep the Workspaces row to filter + new
+// session only.
+const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1';
+
 /** The locally cached project order, or null when unset / malformed. */
 function readSavedProjectOrder(): string[] | null {
   const saved = getPref<unknown>(PROJECT_ORDER_STORAGE_KEY);
@@ -1406,18 +1410,20 @@ export function SidebarSessions({
             Workspaces
           </span>
           <div className="flex items-center gap-0.5">
-            <button
-              type="button"
-              title="Kanban"
-              aria-label="Kanban"
-              onClick={() => router.push('/dashboard/kanban')}
-              className={cn(
-                'flex h-6 w-6 cursor-pointer items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-foreground/[0.06] dark:hover:bg-foreground/10 hover:text-foreground',
-                pathname === '/dashboard/kanban' && ITEM_SELECTED,
-              )}
-            >
-              <Kanban className="h-3.5 w-3.5" />
-            </button>
+            {!IS_DIRECT_WEB && (
+              <button
+                type="button"
+                title="Kanban"
+                aria-label="Kanban"
+                onClick={() => router.push('/dashboard/kanban')}
+                className={cn(
+                  'flex h-6 w-6 cursor-pointer items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-foreground/[0.06] dark:hover:bg-foreground/10 hover:text-foreground',
+                  pathname === '/dashboard/kanban' && ITEM_SELECTED,
+                )}
+              >
+                <Kanban className="h-3.5 w-3.5" />
+              </button>
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
