@@ -12,12 +12,15 @@ object the runner hands to both the daemon thread (writer, via
 tray can distinguish starting / connected / auth_failed.
 """
 
+import os
 import socket
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 import pytest
 import requests
@@ -25,9 +28,14 @@ from starlette.testclient import TestClient
 
 from vicoa.local_server.app import CloudAuthStatus, create_local_app
 from vicoa.local_server.runner import (
+    DEFAULT_DIRECT_STORE_PATH,
+    DEFAULT_DIRECT_TOKEN_PATH,
     LocalListenerLifecycle,
     LocalListenerSettings,
     _local_uvicorn_server,
+    _normalize_public_origin,
+    build_direct_runtime,
+    load_or_create_direct_token,
     local_base_url,
 )
 from vicoa.local_server.store import LocalStore
@@ -75,6 +83,222 @@ def test_listener_settings_shape() -> None:
     )
     assert settings.local_only is True
     assert settings.allowed_origin == "http://localhost:3000"
+
+
+# ----------------------------------------------------------------------
+# Direct mode: no cloud account, local daemon + file-backed SQLite.
+# ----------------------------------------------------------------------
+def test_direct_default_store_path_is_under_vicoa_home() -> None:
+    assert DEFAULT_DIRECT_STORE_PATH == Path.home() / ".vicoa" / "direct" / "store.db"
+
+
+def test_build_direct_runtime_targets_loopback_and_file_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path = tmp_path / "direct" / "store.db"
+    monkeypatch.setenv("VICOA_WS_URL", "ws://cloud.example/ws")
+
+    runtime = build_direct_runtime(
+        port=45991,
+        store_path=store_path,
+        nonce=NONCE,
+        allowed_origin=ORIGIN,
+    )
+    try:
+        assert runtime.settings.local_only is True
+        assert runtime.settings.nonce == NONCE
+        assert runtime.settings.allowed_origin == ORIGIN
+        assert runtime.daemon.base_url == "http://127.0.0.1:45991"
+        assert runtime.daemon.api_key == NONCE
+        assert runtime.store_path == store_path
+        assert store_path.exists()
+        # A leftover cloud override would point spawned runners at the cloud.
+        assert "VICOA_WS_URL" not in os.environ
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, 70000])
+def test_build_direct_runtime_rejects_invalid_port(port: int, tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        build_direct_runtime(port=port, store_path=tmp_path / "store.db")
+
+
+def test_build_direct_runtime_normalizes_public_origin(tmp_path: Path) -> None:
+    runtime = build_direct_runtime(
+        port=45991,
+        store_path=tmp_path / "store.db",
+        nonce=NONCE,
+        public_url="https://machine.tailnet.ts.net/some/path",
+    )
+    try:
+        assert runtime.settings.public_origin == "https://machine.tailnet.ts.net"
+    finally:
+        runtime.store.close()
+
+
+# ----------------------------------------------------------------------
+# Persistent token + public origin
+# ----------------------------------------------------------------------
+def test_direct_default_token_path_is_under_vicoa_home() -> None:
+    assert DEFAULT_DIRECT_TOKEN_PATH == Path.home() / ".vicoa" / "direct" / "token"
+
+
+def test_load_or_create_token_generates_persists_and_reuses(
+    tmp_path: Path,
+) -> None:
+    token_path = tmp_path / "direct" / "token"
+    token, created, resolved = load_or_create_direct_token(token_path=token_path)
+
+    assert created is True
+    assert resolved == token_path
+    assert len(token) == 64
+    assert token_path.read_text(encoding="utf-8").strip() == token
+    assert token_path.stat().st_mode & 0o777 == 0o600
+
+    again, created_again, _ = load_or_create_direct_token(token_path=token_path)
+    assert again == token
+    assert created_again is False
+
+
+def test_load_or_create_token_rotates(tmp_path: Path) -> None:
+    token_path = tmp_path / "token"
+    first, _, _ = load_or_create_direct_token(token_path=token_path)
+
+    rotated, created, _ = load_or_create_direct_token(
+        token_path=token_path, rotate=True
+    )
+
+    assert created is True
+    assert rotated != first
+    assert token_path.read_text(encoding="utf-8").strip() == rotated
+
+
+def test_explicit_token_does_not_touch_the_token_file(tmp_path: Path) -> None:
+    token_path = tmp_path / "token"
+
+    token, created, resolved = load_or_create_direct_token(
+        token_path=token_path, explicit="explicit-token"
+    )
+
+    assert token == "explicit-token"
+    assert created is False
+    assert resolved == token_path
+    assert not token_path.exists()
+
+
+def test_load_or_create_token_replaces_an_empty_file(tmp_path: Path) -> None:
+    token_path = tmp_path / "token"
+    token_path.write_text("", encoding="utf-8")
+
+    token, created, _ = load_or_create_direct_token(token_path=token_path)
+
+    assert created is True
+    assert token.strip() != ""
+    assert token_path.read_text(encoding="utf-8").strip() == token
+
+
+# ----------------------------------------------------------------------
+# Direct-mode session process cleanup
+# ----------------------------------------------------------------------
+class _FakeProcess:
+    def __init__(self, *, pid: int = 999999, stubborn: bool = False) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self._stubborn = stubborn
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if not self._stubborn:
+            self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake", timeout or 0)
+        return self.returncode
+
+
+def _as_popen(process: _FakeProcess) -> subprocess.Popen[bytes]:
+    return cast("subprocess.Popen[bytes]", process)
+
+
+def _daemon() -> MachineDaemon:
+    return MachineDaemon(api_key="test-key", base_url="http://localhost:0")
+
+
+def test_terminate_session_stops_registered_process() -> None:
+    daemon = _daemon()
+    process = _FakeProcess()
+    daemon._register_session_process("session-a", _as_popen(process))
+
+    assert daemon.terminate_session("session-a") is True
+
+    assert process.terminated is True
+    assert daemon._consume_intentionally_terminated("session-a") is True
+    assert daemon.terminate_session("session-a") is False
+
+
+def test_terminate_session_escalates_to_kill() -> None:
+    daemon = _daemon()
+    process = _FakeProcess(stubborn=True)
+    daemon._register_session_process("session-b", _as_popen(process))
+
+    daemon.terminate_session("session-b", timeout=0.01)
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.returncode == -9
+
+
+def test_terminate_all_sessions_stops_every_runner() -> None:
+    daemon = _daemon()
+    first = _FakeProcess()
+    second = _FakeProcess()
+    daemon._register_session_process("session-a", _as_popen(first))
+    daemon._register_session_process("session-b", _as_popen(second))
+
+    stopped = daemon.terminate_all_sessions(timeout=0.01)
+
+    assert sorted(stopped) == ["session-a", "session-b"]
+    assert first.terminated and second.terminated
+    assert daemon._consume_intentionally_terminated("session-a") is True
+    assert daemon._consume_intentionally_terminated("session-b") is True
+
+
+def test_monitor_skips_status_fallback_for_intentional_termination() -> None:
+    daemon = _daemon()
+    process = _FakeProcess()
+    process.returncode = -15
+    updates: list[tuple[str, str]] = []
+    daemon._update_instance_status = lambda sid, status: updates.append((sid, status))  # type: ignore[method-assign]
+    daemon._register_session_process("session-c", _as_popen(process))
+    daemon._mark_intentionally_terminated("session-c")
+
+    daemon._monitor_session_process(
+        request_id="", session_id="session-c", process=_as_popen(process)
+    )
+
+    assert updates == []
+    assert daemon._session_processes == {}
+
+
+def test_normalize_public_origin() -> None:
+    assert _normalize_public_origin("https://machine.tailnet.ts.net/") == (
+        "https://machine.tailnet.ts.net"
+    )
+    assert _normalize_public_origin("http://host:8080/path") == ("http://host:8080")
+    for invalid in ("", "not-a-url", "ftp://host", "https://"):
+        with pytest.raises(ValueError):
+            _normalize_public_origin(invalid)
 
 
 # ----------------------------------------------------------------------

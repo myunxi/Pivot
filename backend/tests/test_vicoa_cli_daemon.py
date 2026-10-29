@@ -1002,3 +1002,77 @@ def test_daemon_without_takeover_still_prompts(monkeypatch, capsys):
 
     assert BASE_URL in prompted["question"]
     assert "vicoa stop daemon" in capsys.readouterr().out
+
+
+# --- direct mode: no cloud account, no credential lookup --------------------
+
+
+def test_daemon_direct_dispatches_before_cloud_auth(monkeypatch):
+    """`vicoa daemon --direct` must never touch stored cloud credentials."""
+    calls: list[Any] = []
+    monkeypatch.setattr(cli, "_run_direct_mode", lambda args: calls.append(args))
+
+    def _no_api_key(_args):
+        raise AssertionError("direct mode must not call ensure_api_key")
+
+    monkeypatch.setattr(cli, "ensure_api_key", _no_api_key)
+
+    args = Namespace(direct=True)
+    cli.cmd_machine_daemon(args)
+
+    assert calls == [args]
+
+
+def test_cmd_direct_shares_the_daemon_direct_impl(monkeypatch):
+    """`vicoa direct` and `vicoa daemon --direct` use one implementation."""
+    calls: list[Any] = []
+    monkeypatch.setattr(cli, "_run_direct_mode", lambda args: calls.append(args))
+
+    args = Namespace(port=45991)
+    cli.cmd_direct(args)
+
+    assert calls == [args]
+
+
+def test_run_direct_mode_forwards_cli_args(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_run_direct_daemon(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "vicoa.local_server.runner.run_direct_daemon", fake_run_direct_daemon
+    )
+    monkeypatch.setattr(cli, "get_current_version", lambda: "1.2.3")
+
+    args = Namespace(
+        port=45991,
+        store="/tmp/direct.db",
+        nonce="test-nonce",
+        origin="http://localhost:3000",
+        public_url="https://machine.tailnet.ts.net/",
+        token_path="/tmp/direct-token",
+        rotate_token=True,
+        show_token=True,
+        with_web=True,
+        web_dir="/tmp/apps/web",
+        web_port=3010,
+        web_upstream="http://127.0.0.1:3010",
+    )
+    cli._run_direct_mode(args)
+
+    assert captured == {
+        "port": 45991,
+        "store_path": "/tmp/direct.db",
+        "nonce": "test-nonce",
+        "allowed_origin": "http://localhost:3000",
+        "public_url": "https://machine.tailnet.ts.net/",
+        "token_path": "/tmp/direct-token",
+        "rotate_token": True,
+        "show_token": True,
+        "with_web": True,
+        "web_dir": "/tmp/apps/web",
+        "web_port": 3010,
+        "web_upstream": "http://127.0.0.1:3010",
+        "cli_version": "1.2.3",
+    }

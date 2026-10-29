@@ -36,20 +36,26 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urlparse, urlsplit, urlunparse
 
 from fastapi import (
     FastAPI,
+    File,
+    Form,
     Header,
     HTTPException,
     Request,
     Response,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketState
+
+import httpx
 
 from protocol.agent_catalog import AGENT_CATALOG_ETAG, AGENT_CATALOG_JSON
 
@@ -59,6 +65,7 @@ from .store import (
     InstanceConflictError,
     InstanceNotFoundError,
     LocalStore,
+    StoredAttachment,
     StoredInstance,
     StoredMessage,
     utc_now_iso,
@@ -73,6 +80,55 @@ from vicoa.terminal.service import TerminalService
 logger = logging.getLogger(__name__)
 
 SERVER_VERSION = "1.0.0"
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+_HEIC_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}
+
+
+def _detect_image_mime(data: bytes) -> str | None:
+    """Validate raster image magic; HEIC is detected so it can be rejected."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _HEIC_BRANDS:
+        return "image/heic"
+    return None
+
+
+def _safe_attachment_filename(name: str | None) -> str | None:
+    if not name:
+        return None
+    base = "".join(ch for ch in os.path.basename(name) if ch.isprintable()).strip()
+    return base[:255] or None
+
+
+def _attachment_response(attachment: StoredAttachment) -> dict:
+    return {
+        "id": attachment.id,
+        "mime_type": attachment.mime_type,
+        "size_bytes": attachment.size_bytes,
+        "width": attachment.width,
+        "height": attachment.height,
+        "filename": attachment.original_filename,
+    }
+
+
+# Headers that must not be forwarded through the web reverse proxy.
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
 # Sane cap on the @-mention scan so a huge working tree can't return a
 # multi-megabyte JSON body over the local socket (the cloud CLI syncs up to
 # 100k; the renderer only needs enough to fuzzy-match against).
@@ -215,9 +271,32 @@ class LocalBroadcastHub:
     def unregister(self, conn: _LocalConnection) -> None:
         self._connections.discard(conn)
 
+    @staticmethod
+    def _accepts(conn: _LocalConnection, frame: dict) -> bool:
+        """Session sockets only see their own instance's updates."""
+        if conn.scope != "session-scoped":
+            return True
+        if not conn.instance_id:
+            return False
+        if frame.get("type") != "update":
+            return False
+        payload = frame.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            return False
+        entity = payload.get("entity")
+        if entity == "messages":
+            return str(body.get("instance_id")) == conn.instance_id
+        if entity == "agent_instances":
+            return str(body.get("id")) == conn.instance_id
+        return False
+
     def _broadcast_on_loop(self, frame: dict) -> None:
         for conn in list(self._connections):
-            conn.enqueue(frame)
+            if self._accepts(conn, frame):
+                conn.enqueue(frame)
 
     def broadcast_threadsafe(self, frame: dict) -> None:
         loop = self._loop
@@ -239,6 +318,8 @@ def create_local_app(
     local_only: bool,
     terminal: TerminalService,
     cloud_status: CloudAuthStatus | None = None,
+    extra_allowed_origins: list[str] | None = None,
+    web_upstream: str | None = None,
 ) -> FastAPI:
     """Build the local server app.
 
@@ -277,6 +358,10 @@ def create_local_app(
     # 127.0.0.1 / [::1]) — same machine, so the exact host the renderer sends
     # must not gate REST or the WS handshake below.
     allowed_origins = _loopback_origin_variants(allowed_origin)
+    for extra in extra_allowed_origins or []:
+        normalized = extra.strip().rstrip("/")
+        if normalized and normalized not in allowed_origins:
+            allowed_origins.append(normalized)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -503,6 +588,55 @@ def create_local_app(
     # ------------------------------------------------------------------
     # Renderer REST subset
     # ------------------------------------------------------------------
+    @app.get("/api/v1/auth/me")
+    def get_current_user_profile(request: Request) -> dict:
+        require_nonce(request)
+        now = utc_now_iso()
+        return {
+            "id": LOCAL_USER_ID,
+            "email": "local@vicoa.direct",
+            "display_name": "Local User",
+            "created_at": now,
+            "avatar_image_uri": None,
+            "avatar_source": None,
+            "avatar_emoji": None,
+            "updated_at": now,
+        }
+
+    # Cloud-data endpoints the dashboard probes on load. Direct mode has no
+    # tasks/projects/automations/agent profiles, so return empty shapes instead
+    # of 404s and keep the console clean.
+    @app.get("/api/v1/agents")
+    def list_agents(request: Request) -> list[dict]:
+        require_nonce(request)
+        return []
+
+    @app.get("/api/v1/activity")
+    def get_activity(request: Request) -> dict:
+        require_nonce(request)
+        return {
+            "daily": {},
+            "total_sessions": 0,
+            "total_user_messages": 0,
+            "total_messages": 0,
+            "as_of": utc_now_iso(),
+        }
+
+    @app.get("/api/v1/tasks")
+    def list_tasks(request: Request) -> list[dict]:
+        require_nonce(request)
+        return []
+
+    @app.get("/api/v1/projects")
+    def list_projects(request: Request) -> list[dict]:
+        require_nonce(request)
+        return []
+
+    @app.get("/api/v1/automations")
+    def list_automations(request: Request) -> list[dict]:
+        require_nonce(request)
+        return []
+
     @app.get("/api/v1/agent-instances")
     def list_agent_instances(
         request: Request, limit: int = 50, offset: int = 0
@@ -564,8 +698,17 @@ def create_local_app(
     def post_instance_message(request: Request, instance_id: str, body: dict) -> dict:
         require_nonce(request)
         content = body.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise HTTPException(status_code=400, detail="content is required")
+        if not isinstance(content, str):
+            content = ""
+        attachment_ids = body.get("attachment_ids") or []
+        if not isinstance(attachment_ids, list) or not all(
+            isinstance(item, str) and item for item in attachment_ids
+        ):
+            raise HTTPException(status_code=400, detail="Invalid attachment_ids")
+        if not content.strip() and not attachment_ids:
+            raise HTTPException(
+                status_code=400, detail="content or attachment_ids is required"
+            )
         try:
             # mark_as_read=False (cloud parity): the message stays pending so
             # the headless agent's /messages/pending poll delivers it.
@@ -574,12 +717,30 @@ def create_local_app(
                 content=content,
                 mark_as_read=False,
                 sender_user_id=LOCAL_USER_ID,
+                attachment_ids=attachment_ids,
             )
         except InstanceNotFoundError as exc:
             raise HTTPException(
                 status_code=404, detail="Agent instance not found"
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _message_response(message, renderer=True)
+
+    @app.post("/api/v1/agents/instances/{instance_id}/heartbeat")
+    def heartbeat_instance(request: Request, instance_id: str) -> dict:
+        require_nonce(request)
+        try:
+            instance = store.heartbeat_instance(instance_id)
+        except InstanceNotFoundError as exc:
+            raise HTTPException(
+                status_code=404, detail="Agent instance not found"
+            ) from exc
+        return {
+            "agent_instance_id": instance.id,
+            "last_heartbeat_at": instance.last_heartbeat_at,
+            "next_interval_seconds": 30,
+        }
 
     @app.get("/api/v1/machines")
     def list_machines(request: Request) -> dict:
@@ -928,6 +1089,49 @@ def create_local_app(
             "status": status,
         }
 
+    @app.patch("/api/v1/messages/{message_id}/consumed")
+    def mark_message_consumed(
+        request: Request, message_id: str, body: dict | None = None
+    ) -> dict:
+        require_nonce(request)
+        steered = bool((body or {}).get("steered"))
+        try:
+            store.mark_message_consumed(message_id, steered=steered)
+        except InstanceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Message not found") from exc
+        return {"success": True, "message_id": message_id}
+
+    @app.patch("/api/v1/messages/{message_id}/requeue")
+    def requeue_message(request: Request, message_id: str) -> dict:
+        require_nonce(request)
+        try:
+            store.requeue_user_message(message_id)
+        except InstanceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Message not found") from exc
+        return {"success": True, "message_id": message_id}
+
+    @app.post("/api/v1/agent-instances/{instance_id}/messages/{message_id}/cancel")
+    def cancel_queued_message(
+        request: Request, instance_id: str, message_id: str
+    ) -> dict:
+        require_nonce(request)
+        try:
+            cancelled = store.cancel_queued_message(instance_id, message_id)
+        except InstanceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Message not found") from exc
+        return {"cancelled": cancelled}
+
+    @app.post("/api/v1/agent-instances/{instance_id}/messages/{message_id}/steer")
+    def steer_queued_message(
+        request: Request, instance_id: str, message_id: str
+    ) -> dict:
+        require_nonce(request)
+        try:
+            steered = store.steer_queued_message(instance_id, message_id)
+        except InstanceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Message not found") from exc
+        return {"steered": steered}
+
     @app.post("/api/v1/sessions/end")
     def end_session(request: Request, body: dict) -> dict:
         require_nonce(request)
@@ -940,6 +1144,9 @@ def create_local_app(
             raise HTTPException(
                 status_code=400, detail="Agent instance not found"
             ) from exc
+        terminate = getattr(daemon, "terminate_session", None)
+        if callable(terminate):
+            terminate(inst.id)
         return {
             "success": True,
             "agent_instance_id": inst.id,
@@ -994,11 +1201,66 @@ def create_local_app(
             headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
         )
 
-    @app.get("/api/v1/attachments/{attachment_id}")
-    def download_attachment(request: Request, attachment_id: str) -> dict:
+    @app.post("/api/v1/attachments")
+    async def upload_attachment(
+        request: Request,
+        agent_instance_id: str = Form(...),
+        file: UploadFile = File(...),
+    ) -> dict:
         require_nonce(request)
-        raise HTTPException(
-            status_code=404, detail="Attachments are not stored in local-only mode"
+        instance = store.get_instance(agent_instance_id)
+        if instance is None or instance.status == "DELETED":
+            raise HTTPException(status_code=404, detail="Agent instance not found")
+
+        data = await file.read(MAX_ATTACHMENT_BYTES + 1)
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB limit"
+                ),
+            )
+        if not data:
+            raise HTTPException(status_code=400, detail="File is empty")
+
+        mime_type = _detect_image_mime(data)
+        if mime_type == "image/heic":
+            raise HTTPException(status_code=400, detail="HEIC images are not supported")
+        if mime_type is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Only JPEG, PNG, GIF, and WebP images are supported",
+            )
+
+        attachment = store.add_attachment(
+            agent_instance_id=agent_instance_id,
+            mime_type=mime_type,
+            data=data,
+            original_filename=_safe_attachment_filename(file.filename),
+        )
+        return _attachment_response(attachment)
+
+    @app.get("/api/v1/attachments/{attachment_id}")
+    def download_attachment(
+        request: Request, attachment_id: str, token: str | None = None
+    ) -> FileResponse:
+        if token is not None:
+            if not hmac.compare_digest(token, nonce):
+                raise HTTPException(status_code=401, detail="unauthorized")
+        else:
+            require_nonce(request)
+
+        attachment = store.get_attachment(attachment_id)
+        path = store.get_attachment_path(attachment_id)
+        if attachment is None or path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        return FileResponse(
+            path,
+            media_type=attachment.mime_type,
+            headers={
+                "Cache-Control": "private, max-age=31536000, immutable",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     # ------------------------------------------------------------------
@@ -1248,6 +1510,95 @@ def create_local_app(
                     logger.exception(
                         "local server: recent-directory update failed after spawn"
                     )
+
+    # Same-origin web: everything that is not a local API/WS route goes to
+    # Next. Registered last so /healthz, /api/v1/*, and /ws win.
+    if web_upstream:
+        upstream_base = web_upstream.rstrip("/")
+
+        @app.api_route(
+            "/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+        )
+        async def proxy_web(request: Request, path: str):
+            headers = {
+                key: value
+                for key, value in request.headers.items()
+                if key.lower() not in HOP_BY_HOP_HEADERS
+            }
+            original_host = request.headers.get("host")
+            forwarded_host = (
+                request.headers.get("x-forwarded-host") or original_host or ""
+            )
+            forwarded_proto = (
+                request.headers.get("x-forwarded-proto") or request.url.scheme
+            )
+            if original_host:
+                headers["host"] = original_host
+            if forwarded_host:
+                headers["x-forwarded-host"] = forwarded_host
+            headers["x-forwarded-proto"] = forwarded_proto
+            if request.client is not None:
+                headers["x-forwarded-for"] = request.client.host
+
+            client = httpx.AsyncClient(timeout=None)
+            try:
+                upstream_request = client.build_request(
+                    request.method,
+                    f"{upstream_base}/{path}",
+                    headers=headers,
+                    params=request.query_params,
+                    content=request.stream(),
+                )
+                upstream = await client.send(upstream_request, stream=True)
+            except httpx.HTTPError as exc:
+                await client.aclose()
+                logger.warning("web upstream %s unavailable: %s", upstream_base, exc)
+                raise HTTPException(
+                    status_code=502, detail="web upstream unavailable"
+                ) from exc
+
+            response_headers = {
+                key: value
+                for key, value in upstream.headers.items()
+                if key.lower() not in HOP_BY_HOP_HEADERS
+            }
+            location = response_headers.get("location")
+            if location:
+                parsed_location = urlparse(location)
+                upstream_origin = urlparse(upstream_base)
+                # Next standalone builds absolute redirects from its own
+                # loopback origin (localhost:3001), which would take the
+                # browser off the daemon and lose its direct-mode token.
+                if (
+                    parsed_location.scheme
+                    and parsed_location.netloc
+                    and (
+                        parsed_location.hostname in {"localhost", "127.0.0.1", "::1"}
+                        or parsed_location.netloc == upstream_origin.netloc
+                    )
+                ):
+                    response_headers["location"] = urlunparse(
+                        (
+                            forwarded_proto,
+                            forwarded_host,
+                            parsed_location.path,
+                            parsed_location.params,
+                            parsed_location.query,
+                            parsed_location.fragment,
+                        )
+                    )
+
+            async def _close_upstream() -> None:
+                await upstream.aclose()
+                await client.aclose()
+
+            return StreamingResponse(
+                upstream.aiter_raw(),
+                status_code=upstream.status_code,
+                headers=response_headers,
+                background=BackgroundTask(_close_upstream),
+            )
 
     return app
 

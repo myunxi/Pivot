@@ -9,6 +9,7 @@ import hashlib
 import hmac
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 
 import pytest
@@ -679,3 +680,530 @@ def test_machines_empty_in_cloud_mode(store: LocalStore, tmp_path: Path) -> None
         assert response.json() == {"machines": []}
         health = cloud_client.get("/healthz").json()
         assert health["mode"] == "cloud" and health["machine_id"] is None
+
+
+# ----------------------------------------------------------------------
+# Heartbeat + queue lifecycle (direct-mode runner)
+# ----------------------------------------------------------------------
+def _user_message(store: LocalStore, instance_id: str, **kwargs) -> str:
+    defaults: dict = {
+        "agent_instance_id": instance_id,
+        "content": "hello",
+        "mark_as_read": False,
+    }
+    defaults.update(kwargs)
+    return store.add_user_message(**defaults).id
+
+
+def _message_by_id(store: LocalStore, instance_id: str, message_id: str):
+    return next(
+        msg
+        for msg in store.get_instance_messages(instance_id, message_limit=100)
+        if msg.id == message_id
+    )
+
+
+def _queue(message: Any) -> dict[str, Any]:
+    assert message.message_metadata is not None
+    return message.message_metadata["queue"]
+
+
+def test_heartbeat_endpoint_updates_timestamp(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    before = store.get_instance(instance_id)
+    assert before is not None
+
+    response = client.post(
+        f"/api/v1/agents/instances/{instance_id}/heartbeat", headers=AUTH
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_instance_id"] == instance_id
+    assert body["next_interval_seconds"] == 30
+    assert body["last_heartbeat_at"].endswith("Z")
+    after = store.get_instance(instance_id)
+    assert after is not None
+    assert after.last_heartbeat_at == body["last_heartbeat_at"]
+
+
+def test_heartbeat_unknown_instance_404(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/agents/instances/missing-id/heartbeat", headers=AUTH
+    )
+    assert response.status_code == 404
+
+
+def test_heartbeat_requires_bearer(client: TestClient) -> None:
+    instance_id = _register(client)
+    response = client.post(f"/api/v1/agents/instances/{instance_id}/heartbeat")
+    assert response.status_code == 401
+
+
+def test_consumed_endpoint_marks_queue(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(
+        store, instance_id, message_metadata={"queue": {"status": "queued"}}
+    )
+
+    response = client.patch(f"/api/v1/messages/{message_id}/consumed", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "message_id": message_id}
+    message = _message_by_id(store, instance_id, message_id)
+    assert _queue(message)["status"] == "consumed"
+
+
+def test_consumed_endpoint_records_steered(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+
+    response = client.patch(
+        f"/api/v1/messages/{message_id}/consumed",
+        json={"steered": True},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    message = _message_by_id(store, instance_id, message_id)
+    assert _queue(message)["steered"] is True
+
+
+def test_consumed_endpoint_does_not_overwrite_cancelled(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(
+        store, instance_id, message_metadata={"queue": {"status": "cancelled"}}
+    )
+
+    response = client.patch(f"/api/v1/messages/{message_id}/consumed", headers=AUTH)
+
+    assert response.status_code == 200
+    message = _message_by_id(store, instance_id, message_id)
+    assert _queue(message) == {"status": "cancelled"}
+
+
+def test_consumed_unknown_message_404(client: TestClient) -> None:
+    response = client.patch("/api/v1/messages/missing-id/consumed", headers=AUTH)
+    assert response.status_code == 404
+
+
+def test_consumed_requires_bearer(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+    assert client.patch(f"/api/v1/messages/{message_id}/consumed").status_code == 401
+
+
+def test_requeue_endpoint_only_touches_steer(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    steer_id = _user_message(
+        store, instance_id, message_metadata={"queue": {"status": "steer"}}
+    )
+    queued_id = _user_message(
+        store, instance_id, message_metadata={"queue": {"status": "queued"}}
+    )
+
+    response = client.patch(f"/api/v1/messages/{steer_id}/requeue", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "message_id": steer_id}
+    steered = _message_by_id(store, instance_id, steer_id)
+    assert _queue(steered)["status"] == "queued"
+    untouched = _message_by_id(store, instance_id, queued_id)
+    assert _queue(untouched) == {"status": "queued"}
+
+
+def test_requeue_unknown_message_404(client: TestClient) -> None:
+    response = client.patch("/api/v1/messages/missing-id/requeue", headers=AUTH)
+    assert response.status_code == 404
+
+
+def test_requeue_requires_bearer(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+    assert client.patch(f"/api/v1/messages/{message_id}/requeue").status_code == 401
+
+
+def test_instance_message_is_queued_while_active(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages",
+        json={"content": "while busy"},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    message = _message_by_id(store, instance_id, response.json()["id"])
+    assert _queue(message)["status"] == "queued"
+
+
+def test_cancel_queued_message_endpoint(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/cancel",
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": True}
+    assert _queue(_message_by_id(store, instance_id, message_id))["status"] == (
+        "cancelled"
+    )
+    again = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/cancel",
+        headers=AUTH,
+    )
+    assert again.json() == {"cancelled": False}
+
+
+def test_steer_queued_message_endpoint(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/steer",
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"steered": True}
+    assert _queue(_message_by_id(store, instance_id, message_id))["status"] == "steer"
+    again = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/steer",
+        headers=AUTH,
+    )
+    assert again.json() == {"steered": False}
+
+
+def test_cancel_does_not_override_consumed_endpoint(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+    client.patch(f"/api/v1/messages/{message_id}/consumed", headers=AUTH)
+
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/cancel",
+        headers=AUTH,
+    )
+
+    assert response.json() == {"cancelled": False}
+    assert _queue(_message_by_id(store, instance_id, message_id))["status"] == (
+        "consumed"
+    )
+
+
+def test_cancel_message_via_another_instance_404(
+    client: TestClient, store: LocalStore
+) -> None:
+    owner_id = _register(client)
+    other_id = _register(client)
+    message_id = _user_message(store, owner_id)
+
+    response = client.post(
+        f"/api/v1/agent-instances/{other_id}/messages/{message_id}/cancel",
+        headers=AUTH,
+    )
+    assert response.status_code == 404
+
+
+def test_cancel_and_steer_unknown_message_404(client: TestClient) -> None:
+    instance_id = _register(client)
+    for action in ("cancel", "steer"):
+        response = client.post(
+            f"/api/v1/agent-instances/{instance_id}/messages/missing-id/{action}",
+            headers=AUTH,
+        )
+        assert response.status_code == 404
+
+
+def test_cancel_and_steer_require_bearer(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+    message_id = _user_message(store, instance_id)
+    for action in ("cancel", "steer"):
+        response = client.post(
+            f"/api/v1/agent-instances/{instance_id}/messages/{message_id}/{action}"
+        )
+        assert response.status_code == 401
+
+
+# ----------------------------------------------------------------------
+# Public origin (Tailscale): CORS allow-list
+# ----------------------------------------------------------------------
+PUBLIC_ORIGIN = "https://machine.tailnet.ts.net"
+
+
+@pytest.fixture
+def public_origin_client(tmp_path: Path) -> Iterator[TestClient]:
+    store = LocalStore(tmp_path / "cors-store.db")
+    app = create_local_app(
+        daemon=StubDaemon(),
+        store=store,
+        nonce=NONCE,
+        allowed_origin=ORIGIN,
+        local_only=True,
+        terminal=TerminalService(),
+        extra_allowed_origins=[PUBLIC_ORIGIN],
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+    store.close()
+
+
+def test_cors_allows_public_origin(public_origin_client: TestClient) -> None:
+    preflight = public_origin_client.options(
+        "/api/v1/machines",
+        headers={
+            "Origin": PUBLIC_ORIGIN,
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == PUBLIC_ORIGIN
+
+    response = public_origin_client.get(
+        "/api/v1/machines", headers={**AUTH, "Origin": PUBLIC_ORIGIN}
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == PUBLIC_ORIGIN
+
+
+def test_cors_rejects_unknown_origin(public_origin_client: TestClient) -> None:
+    preflight = public_origin_client.options(
+        "/api/v1/machines",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert preflight.status_code == 400
+    assert "access-control-allow-origin" not in preflight.headers
+
+    response = public_origin_client.get(
+        "/api/v1/machines",
+        headers={**AUTH, "Origin": "https://evil.example"},
+    )
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
+# ----------------------------------------------------------------------
+# Direct web dashboard: synthetic identity + empty cloud-data stubs
+# ----------------------------------------------------------------------
+def test_auth_me_returns_the_local_user(client: TestClient) -> None:
+    response = client.get("/api/v1/auth/me", headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == LOCAL_USER_ID
+    assert body["email"] == "local@vicoa.direct"
+    assert body["display_name"] == "Local User"
+    assert body["created_at"].endswith("Z")
+    assert body["updated_at"].endswith("Z")
+
+
+def test_auth_me_requires_bearer(client: TestClient) -> None:
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/agents",
+        "/api/v1/tasks",
+        "/api/v1/projects",
+        "/api/v1/automations",
+    ],
+)
+def test_direct_data_lists_are_empty(client: TestClient, path: str) -> None:
+    response = client.get(path, headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+HEIC_BYTES = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 16
+
+
+def _upload_attachment(
+    client: TestClient,
+    instance_id: str,
+    *,
+    data: bytes = PNG_BYTES,
+    filename: str = "pixel.png",
+    mime_type: str = "image/png",
+    headers: dict[str, str] = AUTH,
+):
+    return client.post(
+        "/api/v1/attachments",
+        files={"file": (filename, data, mime_type)},
+        data={"agent_instance_id": instance_id},
+        headers=headers,
+    )
+
+
+def test_attachment_upload_and_download(client: TestClient, store: LocalStore) -> None:
+    instance_id = _register(client)
+
+    response = _upload_attachment(client, instance_id)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mime_type"] == "image/png"
+    assert body["size_bytes"] == len(PNG_BYTES)
+    assert body["filename"] == "pixel.png"
+    attachment_id = body["id"]
+    assert store.get_attachment(attachment_id) is not None
+
+    with_bearer = client.get(f"/api/v1/attachments/{attachment_id}", headers=AUTH)
+    assert with_bearer.status_code == 200
+    assert with_bearer.content == PNG_BYTES
+    assert with_bearer.headers["content-type"].startswith("image/png")
+
+    with_query = client.get(f"/api/v1/attachments/{attachment_id}?token={NONCE}")
+    assert with_query.status_code == 200
+    assert with_query.content == PNG_BYTES
+
+
+def test_attachment_download_requires_auth(client: TestClient) -> None:
+    instance_id = _register(client)
+    attachment_id = _upload_attachment(client, instance_id).json()["id"]
+
+    assert client.get(f"/api/v1/attachments/{attachment_id}").status_code == 401
+    assert (
+        client.get(f"/api/v1/attachments/{attachment_id}?token=wrong").status_code
+        == 401
+    )
+    assert (
+        client.get("/api/v1/attachments/missing-attachment", headers=AUTH).status_code
+        == 404
+    )
+
+
+def test_attachment_upload_requires_auth(client: TestClient) -> None:
+    instance_id = _register(client)
+    response = _upload_attachment(client, instance_id, headers={})
+    assert response.status_code == 401
+
+
+def test_attachment_upload_rejects_non_images(client: TestClient) -> None:
+    instance_id = _register(client)
+
+    text = _upload_attachment(
+        client,
+        instance_id,
+        data=b"hello",
+        filename="note.txt",
+        mime_type="text/plain",
+    )
+    assert text.status_code == 400
+
+    heic = _upload_attachment(
+        client,
+        instance_id,
+        data=HEIC_BYTES,
+        filename="photo.heic",
+        mime_type="image/heic",
+    )
+    assert heic.status_code == 400
+
+
+def test_attachment_upload_requires_an_instance(client: TestClient) -> None:
+    response = _upload_attachment(client, "missing-instance")
+    assert response.status_code == 404
+
+
+def test_user_message_with_attachments_stamps_metadata(
+    client: TestClient, store: LocalStore
+) -> None:
+    instance_id = _register(client)
+    attachment_id = _upload_attachment(client, instance_id).json()["id"]
+
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages",
+        json={"content": "", "attachment_ids": [attachment_id]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    message_id = response.json()["id"]
+    detail = client.get(
+        f"/api/v1/agent-instances/{instance_id}?message_limit=20",
+        headers=AUTH,
+    ).json()
+    message = next(m for m in detail["messages"] if m["id"] == message_id)
+    attachments = message["message_metadata"]["attachments"]
+    assert attachments[0]["id"] == attachment_id
+    bound = store.get_attachment(attachment_id)
+    assert bound is not None
+    assert bound.message_id == message_id
+
+
+def test_user_message_rejects_unknown_attachment(
+    client: TestClient,
+) -> None:
+    instance_id = _register(client)
+    response = client.post(
+        f"/api/v1/agent-instances/{instance_id}/messages",
+        json={"content": "", "attachment_ids": ["missing-attachment"]},
+        headers=AUTH,
+    )
+    assert response.status_code == 400
+
+
+def test_end_session_terminates_the_runner(tmp_path: Path) -> None:
+    class TerminatingDaemon(StubDaemon):
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+
+        def terminate_session(self, agent_instance_id: str) -> bool:
+            self.terminated.append(agent_instance_id)
+            return True
+
+    store = LocalStore(tmp_path / "end-session.db")
+    daemon = TerminatingDaemon()
+    app = create_local_app(
+        daemon=daemon,
+        store=store,
+        nonce=NONCE,
+        allowed_origin=ORIGIN,
+        local_only=True,
+        terminal=TerminalService(),
+    )
+    try:
+        with TestClient(app) as client:
+            instance_id = _register(client)
+            response = client.post(
+                "/api/v1/sessions/end",
+                json={"agent_instance_id": instance_id},
+                headers=AUTH,
+            )
+            assert response.status_code == 200
+            assert response.json()["final_status"] == "COMPLETED"
+        assert daemon.terminated == [instance_id]
+    finally:
+        store.close()
+
+
+def test_activity_stub_shape(client: TestClient) -> None:
+    response = client.get("/api/v1/activity", headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["daily"] == {}
+    assert body["total_sessions"] == 0
+    assert body["total_user_messages"] == 0
+    assert body["total_messages"] == 0
+    assert body["as_of"].endswith("Z")

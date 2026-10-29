@@ -35,6 +35,7 @@ dependencies = [
     # Range support in FileResponse (0.39), which the local server's video
     # streaming relies on for seeking.
     "starlette>=0.39.0",
+    "python-multipart>=0.0.9",
     "uvicorn>=0.20.0",
     # Server-side WebSocket protocol for uvicorn (the local desktop listener's
     # /ws endpoint); bare uvicorn ships without one.

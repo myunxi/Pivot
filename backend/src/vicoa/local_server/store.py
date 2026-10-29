@@ -31,6 +31,7 @@ from typing import Any, Callable, Iterable
 from .envelopes import (
     build_instance_created_update,
     build_instance_update,
+    build_message_update,
     build_new_message_update,
 )
 
@@ -61,6 +62,13 @@ WS_FETCH_PAGE_LIMIT = 200
 WS_FETCH_SAFETY_WINDOW = timedelta(seconds=30)
 
 _RECENT_DIRECTORIES_LIMIT = 10
+
+_ATTACHMENT_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 # Namespace for deterministic per-agent-type "user_agent" ids, so the same
 # agent type always maps to the same agent_type_id across restarts.
@@ -149,6 +157,20 @@ class StoredMessage:
     seq: int
 
 
+@dataclass(slots=True)
+class StoredAttachment:
+    id: str
+    agent_instance_id: str
+    message_id: str | None
+    mime_type: str
+    size_bytes: int
+    width: int | None
+    height: int | None
+    original_filename: str | None
+    stored_path: str
+    created_at: str
+
+
 class LocalStore:
     """Thread-safe SQLite store with an in-process broadcast hook."""
 
@@ -160,6 +182,11 @@ class LocalStore:
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._attachments_dir = (
+            None if str(path) == ":memory:" else path.parent / "attachments"
+        )
+        if self._attachments_dir is not None:
+            self._attachments_dir.mkdir(parents=True, exist_ok=True)
         self._create_tables()
         self._listeners: list[Callable[[dict], None]] = []
 
@@ -206,6 +233,22 @@ class LocalStore:
                     directory TEXT PRIMARY KEY,
                     used_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id TEXT PRIMARY KEY,
+                    agent_instance_id TEXT NOT NULL,
+                    message_id TEXT,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    original_filename TEXT,
+                    stored_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_attachments_instance
+                    ON attachments (agent_instance_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_attachments_message
+                    ON attachments (message_id);
                 """
             )
             self._conn.commit()
@@ -263,6 +306,21 @@ class LocalStore:
             created_at=row["created_at"],
             sender_user_id=row["sender_user_id"],
             seq=row["seq"],
+        )
+
+    @staticmethod
+    def _attachment_from_row(row: sqlite3.Row) -> StoredAttachment:
+        return StoredAttachment(
+            id=row["id"],
+            agent_instance_id=row["agent_instance_id"],
+            message_id=row["message_id"],
+            mime_type=row["mime_type"],
+            size_bytes=row["size_bytes"],
+            width=row["width"],
+            height=row["height"],
+            original_filename=row["original_filename"],
+            stored_path=row["stored_path"],
+            created_at=row["created_at"],
         )
 
     def _get_instance_row(self, instance_id: str) -> sqlite3.Row | None:
@@ -458,6 +516,20 @@ class LocalStore:
     def end_session(self, instance_id: str) -> StoredInstance:
         """Mirror ``POST /api/v1/sessions/end`` (mark COMPLETED)."""
         return self.update_instance_status(instance_id, "COMPLETED")
+
+    def heartbeat_instance(self, instance_id: str) -> StoredInstance:
+        """Mirror ``POST /api/v1/agents/instances/{id}/heartbeat``."""
+        with self._lock:
+            row = self._get_instance_row(instance_id)
+            if row is None or row["status"] == "DELETED":
+                raise InstanceNotFoundError(instance_id)
+            self._touch_instance(instance_id, {"last_heartbeat_at": utc_now_iso()})
+            self._conn.commit()
+            updated_row = self._get_instance_row(instance_id)
+        assert updated_row is not None
+        instance = self._instance_from_row(updated_row)
+        self._emit([build_instance_update(instance)])
+        return instance
 
     def patch_instance(
         self,
@@ -670,6 +742,142 @@ class LocalStore:
         self._emit(emit)
         return message, instance, queued
 
+    def add_attachment(
+        self,
+        *,
+        agent_instance_id: str,
+        mime_type: str,
+        data: bytes,
+        original_filename: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> StoredAttachment:
+        """Write one attachment to disk and record its metadata."""
+        if self._attachments_dir is None:
+            raise RuntimeError("attachments are unavailable for an in-memory store")
+        with self._lock:
+            instance_row = self._get_instance_row(agent_instance_id)
+            if instance_row is None or instance_row["status"] == "DELETED":
+                raise InstanceNotFoundError(agent_instance_id)
+
+            attachment_id = str(uuid.uuid4())
+            directory = self._attachments_dir / agent_instance_id
+            directory.mkdir(parents=True, exist_ok=True)
+            suffix = _ATTACHMENT_SUFFIX.get(mime_type, ".bin")
+            path = directory / f"{attachment_id}{suffix}"
+            path.write_bytes(data)
+            now = utc_now_iso()
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO attachments (
+                        id, agent_instance_id, message_id, mime_type,
+                        size_bytes, width, height, original_filename,
+                        stored_path, created_at
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attachment_id,
+                        agent_instance_id,
+                        mime_type,
+                        len(data),
+                        width,
+                        height,
+                        original_filename,
+                        str(path),
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                path.unlink(missing_ok=True)
+                self._conn.rollback()
+                raise
+            row = self._conn.execute(
+                "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+            ).fetchone()
+        assert row is not None
+        return self._attachment_from_row(row)
+
+    def get_attachment(self, attachment_id: str) -> StoredAttachment | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+            ).fetchone()
+        return self._attachment_from_row(row) if row is not None else None
+
+    def get_attachment_path(self, attachment_id: str) -> Path | None:
+        attachment = self.get_attachment(attachment_id)
+        return Path(attachment.stored_path) if attachment is not None else None
+
+    def _bind_attachments_locked(
+        self,
+        instance_id: str,
+        message_id: str,
+        attachment_ids: list[str],
+    ) -> list[dict]:
+        if not attachment_ids:
+            return []
+        message_row = self._get_message_row(message_id)
+        if message_row is None or message_row["agent_instance_id"] != instance_id:
+            raise ValueError("Message not found")
+        unique_ids = list(dict.fromkeys(attachment_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM attachments
+            WHERE id IN ({placeholders})
+              AND agent_instance_id = ?
+              AND message_id IS NULL
+            """,
+            (*unique_ids, instance_id),
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        if len(by_id) != len(unique_ids):
+            raise ValueError("Attachment not found or already attached")
+
+        attachments_meta: list[dict] = []
+        for attachment_id in unique_ids:
+            row = by_id[attachment_id]
+            self._conn.execute(
+                "UPDATE attachments SET message_id = ? WHERE id = ?",
+                (message_id, attachment_id),
+            )
+            attachments_meta.append(
+                {
+                    "id": attachment_id,
+                    "mime_type": row["mime_type"],
+                    "size_bytes": row["size_bytes"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "filename": row["original_filename"],
+                }
+            )
+
+        metadata = _load_json(message_row["message_metadata"]) or {}
+        self._conn.execute(
+            "UPDATE messages SET message_metadata = ? WHERE id = ?",
+            (_dump_json({**metadata, "attachments": attachments_meta}), message_id),
+        )
+        return attachments_meta
+
+    def bind_attachments_to_message(
+        self,
+        instance_id: str,
+        message_id: str,
+        attachment_ids: list[str],
+    ) -> list[dict]:
+        with self._lock:
+            try:
+                result = self._bind_attachments_locked(
+                    instance_id, message_id, attachment_ids
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return result
+
     def add_user_message(
         self,
         *,
@@ -678,6 +886,7 @@ class LocalStore:
         mark_as_read: bool,
         message_metadata: dict | None = None,
         sender_user_id: str | None = None,
+        attachment_ids: list[str] | None = None,
     ) -> StoredMessage:
         """Mirror the user-message writes.
 
@@ -690,14 +899,33 @@ class LocalStore:
             row = self._get_instance_row(agent_instance_id)
             if row is None:
                 raise InstanceNotFoundError(agent_instance_id)
+            effective_metadata = dict(message_metadata) if message_metadata else None
+            if (
+                not mark_as_read
+                and row["status"] == "ACTIVE"
+                and "queue" not in (effective_metadata or {})
+            ):
+                effective_metadata = dict(effective_metadata or {})
+                effective_metadata["queue"] = {"status": "queued"}
             message = self._insert_message(
                 instance_id=agent_instance_id,
                 sender_type="USER",
                 content=content,
                 requires_user_input=False,
-                message_metadata=message_metadata,
+                message_metadata=effective_metadata,
                 sender_user_id=sender_user_id,
             )
+            if attachment_ids:
+                try:
+                    self._bind_attachments_locked(
+                        agent_instance_id, message.id, attachment_ids
+                    )
+                except Exception:
+                    self._conn.rollback()
+                    raise
+                refreshed = self._get_message_row(message.id)
+                assert refreshed is not None
+                message = self._message_from_row(refreshed)
             fields: dict[str, Any] = {}
             if row["status"] != "DELETED":
                 fields["status"] = "ACTIVE"
@@ -773,6 +1001,123 @@ class LocalStore:
             emit.append(build_instance_update(self._instance_from_row(updated_row)))
         self._emit(emit)
         return updated_row["id"], queued, "ok"
+
+    def mark_message_consumed(
+        self, message_id: str, *, steered: bool = False
+    ) -> StoredMessage:
+        """Stamp ``queue.status=consumed`` unless the message was cancelled."""
+        with self._lock:
+            row = self._get_message_row(message_id)
+            if row is None:
+                raise InstanceNotFoundError(message_id)
+            metadata = _load_json(row["message_metadata"]) or {}
+            queue = metadata.get("queue")
+            queue = queue if isinstance(queue, dict) else {}
+            if queue.get("status") == "cancelled":
+                return self._message_from_row(row)
+
+            new_queue: dict[str, Any] = {
+                "status": "consumed",
+                "consumed_at": utc_now_iso(),
+            }
+            if steered:
+                new_queue["steered"] = True
+            self._conn.execute(
+                "UPDATE messages SET message_metadata = ? WHERE id = ?",
+                (_dump_json({**metadata, "queue": new_queue}), message_id),
+            )
+            self._conn.commit()
+            updated_row = self._get_message_row(message_id)
+        assert updated_row is not None
+        message = self._message_from_row(updated_row)
+        self._emit([build_message_update(message)])
+        return message
+
+    def _transition_queued_message(
+        self,
+        instance_id: str,
+        message_id: str,
+        target: str,
+        timestamp_key: str,
+    ) -> bool:
+        """Move a USER message from ``queued`` to ``target`` exactly once."""
+        with self._lock:
+            row = self._get_message_row(message_id)
+            if row is None or row["agent_instance_id"] != instance_id:
+                raise InstanceNotFoundError(message_id)
+            if row["sender_type"] != "USER":
+                return False
+            metadata = _load_json(row["message_metadata"]) or {}
+            queue = metadata.get("queue")
+            queue = queue if isinstance(queue, dict) else {}
+            if queue.get("status") != "queued":
+                return False
+            self._conn.execute(
+                "UPDATE messages SET message_metadata = ? WHERE id = ?",
+                (
+                    _dump_json(
+                        {
+                            **metadata,
+                            "queue": {
+                                "status": target,
+                                timestamp_key: utc_now_iso(),
+                            },
+                        }
+                    ),
+                    message_id,
+                ),
+            )
+            self._conn.commit()
+            updated_row = self._get_message_row(message_id)
+        assert updated_row is not None
+        self._emit([build_message_update(self._message_from_row(updated_row))])
+        return True
+
+    def cancel_queued_message(self, instance_id: str, message_id: str) -> bool:
+        """Mirror ``POST /agent-instances/{id}/messages/{mid}/cancel``."""
+        return self._transition_queued_message(
+            instance_id, message_id, "cancelled", "cancelled_at"
+        )
+
+    def steer_queued_message(self, instance_id: str, message_id: str) -> bool:
+        """Mirror ``POST /agent-instances/{id}/messages/{mid}/steer``."""
+        return self._transition_queued_message(
+            instance_id, message_id, "steer", "steer_requested_at"
+        )
+
+    def requeue_user_message(self, message_id: str) -> StoredMessage:
+        """Put a ``queue.status=steer`` message back to ``queued``."""
+        with self._lock:
+            row = self._get_message_row(message_id)
+            if row is None:
+                raise InstanceNotFoundError(message_id)
+            metadata = _load_json(row["message_metadata"]) or {}
+            queue = metadata.get("queue")
+            queue = queue if isinstance(queue, dict) else {}
+            if queue.get("status") != "steer":
+                return self._message_from_row(row)
+
+            self._conn.execute(
+                "UPDATE messages SET message_metadata = ? WHERE id = ?",
+                (
+                    _dump_json(
+                        {
+                            **metadata,
+                            "queue": {
+                                "status": "queued",
+                                "requeued_at": utc_now_iso(),
+                            },
+                        }
+                    ),
+                    message_id,
+                ),
+            )
+            self._conn.commit()
+            updated_row = self._get_message_row(message_id)
+        assert updated_row is not None
+        message = self._message_from_row(updated_row)
+        self._emit([build_message_update(message)])
+        return message
 
     # ------------------------------------------------------------------
     # WS catch-up fetches (mirror servers.shared.db.queries)

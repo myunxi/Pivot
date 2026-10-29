@@ -37,6 +37,22 @@ def build_new_message_update(msg: "StoredMessage") -> dict:
     }
 
 
+def build_message_update(msg: "StoredMessage") -> dict:
+    """``update`` payload for a metadata patch on an existing message row."""
+    status = (msg.message_metadata or {}).get("queue", {}).get("status")
+    return {
+        "entity": "messages",
+        "entity_id": msg.id,
+        "event_id": f"{msg.id}:queue:{status}",
+        "body": {
+            "t": "message-update",
+            "id": msg.id,
+            "instance_id": msg.agent_instance_id,
+            "message_metadata": msg.message_metadata,
+        },
+    }
+
+
 def _instance_row(inst: "StoredInstance", t: str) -> dict:
     """Complete instance row as JSON primitives (mirrors envelope._instance_row)."""
     return {

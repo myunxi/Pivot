@@ -668,6 +668,11 @@ class MachineDaemon:
         self._terminal_lock = Lock()
         self._active_request_ids: set[str] = set()
         self._active_request_ids_lock = Lock()
+        # Direct-mode lifecycle: processes this daemon spawned, so the local
+        # server can stop a runner when its session ends or the daemon exits.
+        self._session_processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._session_processes_lock = Lock()
+        self._intentionally_terminated: set[str] = set()
         self._spawn_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="spawn"
         )
@@ -1998,6 +2003,100 @@ class MachineDaemon:
             logger.debug("could not open stderr log for %s: %s", session_id, exc)
             return subprocess.DEVNULL
 
+    # ------------------------------------------------------------------
+    # Session process lifecycle (direct mode)
+    # ------------------------------------------------------------------
+    def _register_session_process(
+        self, session_id: str, process: subprocess.Popen[bytes]
+    ) -> None:
+        with self._session_processes_lock:
+            self._session_processes[session_id] = process
+
+    def _forget_session_process(
+        self,
+        session_id: str,
+        process: subprocess.Popen[bytes] | None = None,
+    ) -> None:
+        with self._session_processes_lock:
+            current = self._session_processes.get(session_id)
+            if current is not None and (process is None or current is process):
+                self._session_processes.pop(session_id, None)
+
+    def _mark_intentionally_terminated(self, session_id: str) -> None:
+        with self._session_processes_lock:
+            self._intentionally_terminated.add(session_id)
+
+    def _consume_intentionally_terminated(self, session_id: str) -> bool:
+        with self._session_processes_lock:
+            if session_id not in self._intentionally_terminated:
+                return False
+            self._intentionally_terminated.discard(session_id)
+            return True
+
+    def _terminate_process(
+        self, process: subprocess.Popen[bytes], *, timeout: float
+    ) -> None:
+        """SIGTERM the session's process group, then SIGKILL after ``timeout``."""
+        if process.poll() is not None:
+            return
+
+        pgid: int | None = None
+        if os.name == "posix":
+            try:
+                candidate = os.getpgid(process.pid)
+                # Never signal our own process group (a caller may hand us a
+                # process that was not started with start_new_session).
+                if candidate != os.getpgid(0):
+                    pgid = candidate
+            except OSError:
+                pgid = None
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def terminate_session(self, session_id: str, *, timeout: float = 5.0) -> bool:
+        """Stop one spawned runner (and its agent child). Returns True if known."""
+        with self._session_processes_lock:
+            process = self._session_processes.pop(session_id, None)
+        if process is None:
+            return False
+        self._mark_intentionally_terminated(session_id)
+        self._terminate_process(process, timeout=timeout)
+        return True
+
+    def terminate_all_sessions(self, *, timeout: float = 5.0) -> list[str]:
+        """Stop every runner this daemon spawned (direct-mode shutdown)."""
+        with self._session_processes_lock:
+            items = list(self._session_processes.items())
+            self._session_processes.clear()
+            self._intentionally_terminated.update(session_id for session_id, _ in items)
+        for _, process in items:
+            self._terminate_process(process, timeout=timeout)
+        return [session_id for session_id, _ in items]
+
     def _launch_session_process(
         self,
         command: list[str],
@@ -2021,7 +2120,7 @@ class MachineDaemon:
         """
         stderr_log = self._open_session_stderr(session_id)
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 cwd=cwd,
                 env=env,
@@ -2031,6 +2130,8 @@ class MachineDaemon:
                 start_new_session=True,
                 creationflags=_session_creationflags(),
             )
+            self._register_session_process(session_id, process)
+            return process
         finally:
             # The child holds its own dup'd fd now; drop the daemon's copy
             # (the DEVNULL fallback is a bare int with nothing to close).
@@ -2067,6 +2168,9 @@ class MachineDaemon:
                     agent_instance_id=session_id,
                     message=str(exc),
                 )
+                return
+            if self._consume_intentionally_terminated(session_id):
+                logger.info("session %s terminated intentionally", session_id)
                 return
             if return_code == 0:
                 self.report_request_status(
@@ -2114,6 +2218,7 @@ class MachineDaemon:
                 )
                 self._update_instance_status(session_id, fallback_status)
         finally:
+            self._forget_session_process(session_id, process)
             self._active_request_ids.discard(request_id)
 
     # ------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """LocalStore CRUD + pending-delivery semantics (desktop local-only mode)."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,9 +20,14 @@ def store(tmp_path: Path):
 
 
 def _register(store: LocalStore, **kwargs) -> str:
-    defaults = dict(agent_type="Claude Code", project="/tmp/proj")
+    defaults: dict[str, Any] = dict(agent_type="Claude Code", project="/tmp/proj")
     defaults.update(kwargs)
     return store.register_instance(**defaults).id
+
+
+def _queue(message: Any) -> dict[str, Any]:
+    assert message.message_metadata is not None
+    return message.message_metadata["queue"]
 
 
 # ----------------------------------------------------------------------
@@ -243,3 +249,303 @@ def test_recent_directories_roundtrip(store: LocalStore) -> None:
     store.push_recent_directory("/tmp/b")
     store.push_recent_directory("/tmp/a")
     assert store.recent_directories() == ["/tmp/a", "/tmp/b"]
+
+
+# ----------------------------------------------------------------------
+# Heartbeat + queue lifecycle (direct-mode runner)
+# ----------------------------------------------------------------------
+def test_heartbeat_instance_updates_timestamp_and_emits(store: LocalStore) -> None:
+    instance_id = _register(store)
+    before = store.get_instance(instance_id)
+    assert before is not None
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    updated = store.heartbeat_instance(instance_id)
+
+    assert updated.last_heartbeat_at is not None
+    assert updated.last_heartbeat_at >= (before.last_heartbeat_at or "")
+    assert events[-1]["entity"] == "agent_instances"
+    assert events[-1]["body"]["t"] == "instance-update"
+    with pytest.raises(InstanceNotFoundError):
+        store.heartbeat_instance("missing-id")
+
+
+def test_mark_message_consumed_stamps_queue_and_emits(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="queued",
+        mark_as_read=False,
+        message_metadata={"queue": {"status": "queued"}},
+    )
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    updated = store.mark_message_consumed(message.id)
+
+    queue = _queue(updated)
+    assert queue["status"] == "consumed"
+    assert isinstance(queue["consumed_at"], str)
+    assert "steered" not in queue
+    assert events[-1]["entity"] == "messages"
+    assert events[-1]["body"]["t"] == "message-update"
+    assert events[-1]["event_id"] == f"{message.id}:queue:consumed"
+    with pytest.raises(InstanceNotFoundError):
+        store.mark_message_consumed("missing-id")
+
+
+def test_mark_message_consumed_records_steered(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="steer me", mark_as_read=False
+    )
+
+    updated = store.mark_message_consumed(message.id, steered=True)
+
+    assert _queue(updated)["steered"] is True
+
+
+def test_mark_message_consumed_never_overwrites_cancelled(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="cancelled",
+        mark_as_read=False,
+        message_metadata={"queue": {"status": "cancelled"}},
+    )
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    updated = store.mark_message_consumed(message.id)
+
+    assert _queue(updated) == {"status": "cancelled"}
+    assert events == []
+
+
+def test_user_message_is_queued_while_instance_is_active(
+    store: LocalStore,
+) -> None:
+    instance_id = _register(store)
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="while busy", mark_as_read=False
+    )
+
+    assert _queue(message)["status"] == "queued"
+    assert events[-1]["body"]["message_metadata"]["queue"]["status"] == "queued"
+
+
+def test_user_message_is_not_queued_when_awaiting_input(
+    store: LocalStore,
+) -> None:
+    instance_id = _register(store)
+    store.update_instance_status(instance_id, "AWAITING_INPUT")
+
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="next turn", mark_as_read=False
+    )
+
+    assert message.message_metadata is None
+
+
+def test_user_message_preserves_an_explicit_queue_status(
+    store: LocalStore,
+) -> None:
+    instance_id = _register(store)
+
+    message = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="already steering",
+        mark_as_read=False,
+        message_metadata={"queue": {"status": "steer"}},
+    )
+
+    assert _queue(message) == {"status": "steer"}
+
+
+def test_mark_as_read_user_message_is_not_queued(store: LocalStore) -> None:
+    instance_id = _register(store)
+
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="sdk write", mark_as_read=True
+    )
+
+    assert message.message_metadata is None
+
+
+def test_cancel_queued_message(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="cancel me", mark_as_read=False
+    )
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    assert store.cancel_queued_message(instance_id, message.id) is True
+
+    updated = store.get_instance_messages(instance_id, message_limit=10)[0]
+    queue = _queue(updated)
+    assert queue["status"] == "cancelled"
+    assert isinstance(queue["cancelled_at"], str)
+    assert events[-1]["event_id"] == f"{message.id}:queue:cancelled"
+    # Only a plainly queued message can be cancelled once.
+    assert store.cancel_queued_message(instance_id, message.id) is False
+
+
+def test_cancel_does_not_override_consumed(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="taken", mark_as_read=False
+    )
+    store.mark_message_consumed(message.id)
+
+    assert store.cancel_queued_message(instance_id, message.id) is False
+    updated = store.get_instance_messages(instance_id, message_limit=10)[0]
+    assert _queue(updated)["status"] == "consumed"
+
+
+def test_steer_queued_message(store: LocalStore) -> None:
+    instance_id = _register(store)
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="steer me", mark_as_read=False
+    )
+    events: list[dict] = []
+    store.add_listener(events.append)
+
+    assert store.steer_queued_message(instance_id, message.id) is True
+
+    updated = store.get_instance_messages(instance_id, message_limit=10)[0]
+    queue = _queue(updated)
+    assert queue["status"] == "steer"
+    assert isinstance(queue["steer_requested_at"], str)
+    assert events[-1]["event_id"] == f"{message.id}:queue:steer"
+    assert store.steer_queued_message(instance_id, message.id) is False
+
+
+def test_cancel_and_steer_require_the_owning_instance(store: LocalStore) -> None:
+    instance_id = _register(store)
+    other_id = _register(store, agent_instance_id="other-instance")
+    message = store.add_user_message(
+        agent_instance_id=instance_id, content="mine", mark_as_read=False
+    )
+
+    with pytest.raises(InstanceNotFoundError):
+        store.cancel_queued_message(other_id, message.id)
+    with pytest.raises(InstanceNotFoundError):
+        store.steer_queued_message(other_id, message.id)
+    with pytest.raises(InstanceNotFoundError):
+        store.cancel_queued_message(instance_id, "missing-id")
+
+
+def test_attachment_roundtrip_and_message_binding(store: LocalStore) -> None:
+    instance_id = _register(store)
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+    attachment = store.add_attachment(
+        agent_instance_id=instance_id,
+        mime_type="image/png",
+        data=data,
+        original_filename="pixel.png",
+    )
+
+    assert attachment.id
+    assert attachment.mime_type == "image/png"
+    assert attachment.size_bytes == len(data)
+    assert attachment.original_filename == "pixel.png"
+    assert store.get_attachment(attachment.id) == attachment
+    attachment_path = store.get_attachment_path(attachment.id)
+    assert attachment_path is not None
+    assert attachment_path.read_bytes() == data
+
+    message = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="",
+        mark_as_read=False,
+        attachment_ids=[attachment.id],
+    )
+
+    metadata = message.message_metadata or {}
+    assert metadata["attachments"] == [
+        {
+            "id": attachment.id,
+            "mime_type": "image/png",
+            "size_bytes": len(data),
+            "width": None,
+            "height": None,
+            "filename": "pixel.png",
+        }
+    ]
+    bound = store.get_attachment(attachment.id)
+    assert bound is not None
+    assert bound.message_id == message.id
+
+
+def test_attachment_cannot_be_bound_twice(store: LocalStore) -> None:
+    instance_id = _register(store)
+    attachment = store.add_attachment(
+        agent_instance_id=instance_id,
+        mime_type="image/png",
+        data=b"\x89PNG\r\n\x1a\n",
+    )
+    store.add_user_message(
+        agent_instance_id=instance_id,
+        content="first",
+        mark_as_read=False,
+        attachment_ids=[attachment.id],
+    )
+
+    with pytest.raises(ValueError, match="Attachment"):
+        store.add_user_message(
+            agent_instance_id=instance_id,
+            content="second",
+            mark_as_read=False,
+            attachment_ids=[attachment.id],
+        )
+
+
+def test_attachment_must_belong_to_the_instance(store: LocalStore) -> None:
+    owner_id = _register(store)
+    other_id = _register(store, agent_instance_id="other-instance")
+    attachment = store.add_attachment(
+        agent_instance_id=owner_id,
+        mime_type="image/png",
+        data=b"\x89PNG\r\n\x1a\n",
+    )
+
+    with pytest.raises(ValueError, match="Attachment"):
+        store.add_user_message(
+            agent_instance_id=other_id,
+            content="wrong instance",
+            mark_as_read=False,
+            attachment_ids=[attachment.id],
+        )
+
+    assert store.get_attachment("missing-attachment") is None
+
+
+def test_requeue_only_steer_messages(store: LocalStore) -> None:
+    instance_id = _register(store)
+    steer = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="steer",
+        mark_as_read=False,
+        message_metadata={"queue": {"status": "steer"}},
+    )
+    queued = store.add_user_message(
+        agent_instance_id=instance_id,
+        content="queued",
+        mark_as_read=False,
+        message_metadata={"queue": {"status": "queued"}},
+    )
+
+    updated = store.requeue_user_message(steer.id)
+
+    assert _queue(updated)["status"] == "queued"
+    assert isinstance(_queue(updated)["requeued_at"], str)
+    unchanged = store.requeue_user_message(queued.id)
+    assert _queue(unchanged) == {"status": "queued"}
+    with pytest.raises(InstanceNotFoundError):
+        store.requeue_user_message("missing-id")

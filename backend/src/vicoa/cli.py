@@ -925,8 +925,107 @@ def _resolve_local_listener_settings(args):
     )
 
 
+def _add_direct_args(parser) -> None:
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Loopback port for direct mode (default: 8765)",
+    )
+    parser.add_argument(
+        "--store",
+        default=None,
+        help="SQLite path for direct mode (default: ~/.vicoa/direct/store.db)",
+    )
+    parser.add_argument(
+        "--token",
+        "--nonce",
+        dest="nonce",
+        default=None,
+        help="Explicit direct-mode token (persisted token file when omitted)",
+    )
+    parser.add_argument(
+        "--token-path",
+        default=None,
+        help="Direct-mode token file (default: ~/.vicoa/direct/token)",
+    )
+    parser.add_argument(
+        "--rotate-token",
+        action="store_true",
+        help="Generate a new direct-mode token and overwrite the token file",
+    )
+    parser.add_argument(
+        "--show-token",
+        action="store_true",
+        help="Print the stored token and pairing link on startup",
+    )
+    parser.add_argument(
+        "--public-url",
+        default=None,
+        help="Public https origin (e.g. a Tailscale Serve URL) for CORS/WS",
+    )
+    parser.add_argument(
+        "--with-web",
+        action="store_true",
+        help="Start and supervise the Next web server, and proxy non-API HTTP to it",
+    )
+    parser.add_argument(
+        "--web-dir",
+        default=None,
+        help="Path to the built apps/web directory (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=3000,
+        help="Loopback port for the supervised Next server (default: 3000)",
+    )
+    parser.add_argument(
+        "--web-upstream",
+        default=None,
+        help="Proxy non-API HTTP to this Next origin instead of starting Next",
+    )
+    parser.add_argument(
+        "--origin",
+        default=None,
+        help="Browser origin allowed by CORS/WebSocket (default: the loopback URL)",
+    )
+
+
+def _run_direct_mode(args) -> None:
+    from vicoa.local_server.runner import run_direct_daemon
+    from vicoa.local_server.web_supervisor import DEFAULT_WEB_PORT
+
+    try:
+        run_direct_daemon(
+            port=getattr(args, "port", 8765),
+            store_path=getattr(args, "store", None),
+            nonce=getattr(args, "nonce", None),
+            allowed_origin=getattr(args, "origin", None),
+            public_url=getattr(args, "public_url", None),
+            token_path=getattr(args, "token_path", None),
+            rotate_token=getattr(args, "rotate_token", False),
+            show_token=getattr(args, "show_token", False),
+            with_web=getattr(args, "with_web", False),
+            web_dir=getattr(args, "web_dir", None),
+            web_port=getattr(args, "web_port", DEFAULT_WEB_PORT),
+            web_upstream=getattr(args, "web_upstream", None),
+            cli_version=get_current_version(),
+        )
+    except KeyboardInterrupt:
+        print("\n[INFO] Daemon stopped by user")
+
+
+def cmd_direct(args) -> None:
+    _run_direct_mode(args)
+
+
 def cmd_machine_daemon(args):
     """Run the machine daemon to handle remote spawn requests."""
+    if getattr(args, "direct", False):
+        _run_direct_mode(args)
+        return
+
     local_settings = _resolve_local_listener_settings(args)
 
     if local_settings is not None and local_settings.local_only:
@@ -1665,6 +1764,19 @@ Examples:
             "(desktop logged-out mode; requires --local-listener)"
         ),
     )
+    daemon_parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Run a no-cloud local server on 127.0.0.1 (no login required)",
+    )
+    _add_direct_args(daemon_parser)
+
+    # 'direct' subcommand — a top-level alias for `daemon --direct`.
+    direct_parser = subparsers.add_parser(
+        "direct",
+        help="Run a no-cloud local server on 127.0.0.1 (no login required)",
+    )
+    _add_direct_args(direct_parser)
 
     # 'ls' subcommand — read-only enumeration of active sessions
     ls_parser = subparsers.add_parser(
@@ -2556,6 +2668,8 @@ Examples:
         cmd_headless(args, unknown_args)
     elif args.command == "daemon":
         cmd_machine_daemon(args)
+    elif args.command == "direct":
+        cmd_direct(args)
     elif args.command == "ls":
         cmd_ls(args)
     elif args.command == "stop":

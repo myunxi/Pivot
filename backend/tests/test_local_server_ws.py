@@ -18,7 +18,7 @@ import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from vicoa.local_server.app import create_local_app
+from vicoa.local_server.app import LocalBroadcastHub, _LocalConnection, create_local_app
 from vicoa.local_server.store import LocalStore
 from vicoa.terminal.service import TerminalService
 
@@ -86,6 +86,60 @@ def client(store: LocalStore, terminal: TerminalService) -> Iterator[TestClient]
 def _handshake(ws: Any, scope: str = "user-scoped", **fields: Any) -> dict:
     ws.send_json({"type": "hello", "scope": scope, **fields})
     return ws.receive_json()
+
+
+def _drain(conn: _LocalConnection) -> list[dict]:
+    frames: list[dict] = []
+    while not conn.outbox.empty():
+        frames.append(conn.outbox.get_nowait())
+    return frames
+
+
+def test_session_scoped_broadcast_is_room_isolated() -> None:
+    """A runner must only see updates for its own instance.
+
+    Before the fix the hub fanned every frame out to every socket, so two
+    runners received each other's user messages and control commands (e.g.
+    changing permission mode in session A made session B reply too).
+    """
+    hub = LocalBroadcastHub()
+    session_a = _LocalConnection("conn-a", "session-scoped", "instance-a")
+    session_b = _LocalConnection("conn-b", "session-scoped", "instance-b")
+    user = _LocalConnection("conn-user", "user-scoped", None)
+    for conn in (session_a, session_b, user):
+        hub.register(conn)
+
+    message_a = {
+        "type": "update",
+        "payload": {"entity": "messages", "body": {"instance_id": "instance-a"}},
+    }
+    hub._broadcast_on_loop(message_a)
+    assert _drain(session_a) == [message_a]
+    assert _drain(session_b) == []
+    assert _drain(user) == [message_a]
+
+    instance_b = {
+        "type": "update",
+        "payload": {"entity": "agent_instances", "body": {"id": "instance-b"}},
+    }
+    hub._broadcast_on_loop(instance_b)
+    assert _drain(session_a) == []
+    assert _drain(session_b) == [instance_b]
+    assert _drain(user) == [instance_b]
+
+    pty_output = {"type": "pty-output", "payload": {"data": "x"}}
+    hub._broadcast_on_loop(pty_output)
+    assert _drain(session_a) == []
+    assert _drain(session_b) == []
+    assert _drain(user) == [pty_output]
+
+    unrelated = {
+        "type": "update",
+        "payload": {"entity": "machines", "body": {"id": "instance-a"}},
+    }
+    hub._broadcast_on_loop(unrelated)
+    assert _drain(session_a) == []
+    assert _drain(user) == [unrelated]
 
 
 # ----------------------------------------------------------------------
@@ -213,6 +267,79 @@ def test_renderer_vicoa_local_still_pinned_to_its_own_origin(
         ) as ws:
             ws.receive_json()
     assert excinfo.value.code == 4403
+
+
+# ----------------------------------------------------------------------
+# Public origin (Tailscale): renderer sockets follow the CORS allow-list;
+# the headless agent's `vicoa-key.` socket stays loopback-only.
+# ----------------------------------------------------------------------
+PUBLIC_ORIGIN = "https://machine.tailnet.ts.net"
+
+
+@pytest.fixture
+def public_origin_client(terminal: TerminalService) -> Iterator[TestClient]:
+    store = LocalStore(":memory:")
+    app = create_local_app(
+        daemon=StubDaemon(),
+        store=store,
+        nonce=NONCE,
+        allowed_origin=ORIGIN,
+        local_only=True,
+        terminal=terminal,
+        extra_allowed_origins=[PUBLIC_ORIGIN],
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+    store.close()
+
+
+def test_vicoa_local_accepts_public_origin(
+    public_origin_client: TestClient,
+) -> None:
+    with public_origin_client.websocket_connect(
+        "/ws",
+        subprotocols=GOOD_SUBPROTOCOLS,
+        headers={"Origin": PUBLIC_ORIGIN},
+    ) as ws:
+        assert _handshake(ws)["type"] == "server_info"
+
+
+def test_vicoa_local_rejects_unknown_origin(
+    public_origin_client: TestClient,
+) -> None:
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with public_origin_client.websocket_connect(
+            "/ws",
+            subprotocols=GOOD_SUBPROTOCOLS,
+            headers={"Origin": "https://evil.example"},
+        ) as ws:
+            ws.receive_json()
+    assert excinfo.value.code == 4403
+
+
+def test_vicoa_key_still_rejects_public_origin(
+    public_origin_client: TestClient,
+) -> None:
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with public_origin_client.websocket_connect(
+            "/ws",
+            subprotocols=["vicoa-ws", f"vicoa-key.{NONCE}"],
+            headers={"Origin": PUBLIC_ORIGIN},
+        ) as ws:
+            ws.receive_json()
+    assert excinfo.value.code == 4403
+
+
+def test_vicoa_key_still_accepts_loopback_origin(
+    public_origin_client: TestClient,
+) -> None:
+    with public_origin_client.websocket_connect(
+        "/ws",
+        subprotocols=["vicoa-ws", f"vicoa-key.{NONCE}"],
+        headers={"Origin": "http://127.0.0.1:8931"},
+    ) as ws:
+        info = _handshake(ws, scope="session-scoped", instance_id="abc")
+        assert info["type"] == "server_info"
 
 
 def test_rejects_malformed_hello(client: TestClient) -> None:

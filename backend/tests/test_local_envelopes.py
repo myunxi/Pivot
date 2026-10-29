@@ -14,6 +14,7 @@ from shared.websocket.envelope import (
     build_instance_created_update as shared_instance_created,
     build_instance_update as shared_instance_update,
     build_machine_update as shared_machine_update,
+    build_message_update as shared_message_update,
     build_new_message_update as shared_new_message,
 )
 
@@ -111,6 +112,34 @@ def _paired_instance() -> tuple[AgentInstance, StoredInstance]:
         pinned_at=None,
     )
     return orm, stored
+
+
+def test_message_update_payload_parity() -> None:
+    message_id = uuid4()
+    instance_id = uuid4()
+    metadata = {"queue": {"status": "consumed", "consumed_at": _TS_WIRE}}
+    orm = Message(
+        id=message_id,
+        agent_instance_id=instance_id,
+        sender_type=SenderType.USER,
+        sender_user_id=None,
+        content="hello",
+        created_at=_TS,
+        requires_user_input=False,
+        message_metadata=metadata,
+    )
+    stored = StoredMessage(
+        id=str(message_id),
+        agent_instance_id=str(instance_id),
+        sender_type="USER",
+        content="hello",
+        requires_user_input=False,
+        message_metadata=metadata,
+        created_at=_TS_WIRE,
+        sender_user_id=None,
+        seq=1,
+    )
+    assert local_envelopes.build_message_update(stored) == shared_message_update(orm)
 
 
 def test_instance_created_payload_parity() -> None:
