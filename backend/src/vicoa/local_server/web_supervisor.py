@@ -162,6 +162,9 @@ class WebSupervisor:
         return self._process is not None and self._process.poll() is None
 
     def start(self) -> None:
+        # A rebuild regenerates the standalone tree without its static assets;
+        # refresh them on every spawn so a respawn serves the newest build.
+        _copy_standalone_assets(self.web_dir)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "ab", buffering=0)
         env = os.environ.copy()

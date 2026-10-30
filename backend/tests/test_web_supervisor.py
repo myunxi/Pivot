@@ -58,6 +58,33 @@ def test_find_standalone_command_refreshes_existing_assets(
     assert (stale_public / "sw.js").read_text() == "// new worker\n"
 
 
+def test_start_refreshes_standalone_assets(tmp_path: Path) -> None:
+    web_dir = tmp_path / "web"
+    web_dir.mkdir()
+    standalone = web_dir / ".next" / "standalone"
+    standalone.mkdir(parents=True)
+    (standalone / "server.js").write_text("// server\n")
+    (web_dir / ".next" / "static").mkdir(parents=True)
+    (web_dir / ".next" / "static" / "new.js").write_text("// new\n")
+    (web_dir / "public").mkdir()
+    (web_dir / "public" / "sw.js").write_text("// new worker\n")
+
+    supervisor = WebSupervisor(
+        web_dir=web_dir,
+        port=3997,
+        upstream="http://127.0.0.1:3997",
+        log_path=tmp_path / "next.log",
+        command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=standalone,
+    )
+    try:
+        supervisor.start()
+        assert (standalone / ".next" / "static" / "new.js").read_text() == "// new\n"
+        assert (standalone / "public" / "sw.js").read_text() == "// new worker\n"
+    finally:
+        supervisor.stop()
+
+
 def test_find_next_start_command(tmp_path: Path) -> None:
     web_dir = tmp_path / "web"
     (web_dir / "node_modules" / ".bin").mkdir(parents=True)
