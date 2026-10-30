@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AgentTypeIcon } from '@/components/dashboard/agent-type-icon';
 import { PrincipalAvatar } from '@/components/ui/principal-avatar';
+import { BrandWordmark } from '@/components/dashboard/brand-wordmark';
 import { SessionParticipants } from '@/components/dashboard/session-participants';
 import { messageAuthorResolver, transcriptBylines } from '@/lib/session-people';
 import { useCurrentUserId } from '@/lib/hooks/use-current-user-id';
@@ -2358,7 +2359,7 @@ function AgentInstanceContent() {
             {desktopChrome.isDesktop && desktopChrome.sidebarCollapsed && (
               <div style={DRAG_REGION} className="flex h-full shrink-0 items-center gap-1.5">
                 <DesktopTitlebarLead />
-                <span className="text-sm font-normal text-foreground">Vicoa</span>
+                <BrandWordmark className="text-sm font-normal text-foreground" />
                 <button
                   type="button"
                   onClick={desktopChrome.expandSidebar}

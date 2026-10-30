@@ -59,6 +59,7 @@ import { matchesShortcut, comboKeycaps, getShortcutCombo } from '@/lib/desktop-s
 import { SearchPalette } from '@/components/dashboard/search-palette';
 import { useHiddenSidebarNavItems } from '@/lib/sidebar-nav-pref';
 import { useDesktopNotificationNavigation } from '@/lib/hooks/use-desktop-session-notifications';
+import { BrandWordmark } from '@/components/dashboard/brand-wordmark';
 import { DesktopConnectionBanner } from '@/components/dashboard/desktop-connection-banner';
 import { DesktopNotificationNudge } from '@/components/dashboard/desktop-notification-nudge';
 import { DesktopChromeProvider } from '@/components/dashboard/desktop-chrome-context';
@@ -302,6 +303,18 @@ function DashboardSidebar({
   }, [api, onMobileClose]);
 
   return (
+    <>
+      {/* Mobile close overlay. A sibling of the drawer, not a child: the
+          drawer's transform would otherwise make it the containing block for
+          this fixed element, shrinking the backdrop to the drawer's own box
+          and leaving taps on the page unable to close it. */}
+      {isMobileOpen && (
+        <div
+          aria-hidden="true"
+          className="xl:hidden fixed inset-0 bg-background/80 backdrop-blur-sm z-40"
+          onClick={onMobileClose}
+        />
+      )}
     <aside
       ref={sidebarRef}
       className={`fixed inset-y-0 left-0 z-50 bg-surface-nav border-r border-border flex flex-col xl:relative xl:translate-x-0 transform transition-[transform] duration-300 ease-in-out font-mono text-sm ${
@@ -309,14 +322,6 @@ function DashboardSidebar({
       } xl:block`}
       style={{ width: showSideBar ? sidebarWidth : 56 }}
     >
-      {/* Mobile close overlay */}
-      {isMobileOpen && (
-        <div
-          className="xl:hidden fixed inset-0 bg-background/80 backdrop-blur-sm z-40"
-          onClick={onMobileClose}
-        />
-      )}
-
       {/* Sidebar content */}
       <div className="relative z-50 flex flex-col h-full bg-surface-nav">
         {/* Logo Header */}
@@ -341,14 +346,7 @@ function DashboardSidebar({
           ) : (
             <>
               <Link href="/dashboard" className="flex items-center">
-                <Image
-                  src="/images/vicoa-logo-text.webp"
-                  alt="Vicoa Logo"
-                  width={0}
-                  height={0}
-                  sizes="100vw"
-                  className="h-6 w-auto"
-                />
+                <BrandWordmark />
               </Link>
               <div className="flex items-center gap-1">
                 <Button
@@ -757,6 +755,7 @@ function DashboardSidebar({
       )}
 
     </aside>
+    </>
   );
 }
 
@@ -931,14 +930,7 @@ function DashboardShell({
                 <Menu className="h-5 w-5" />
                 <span className="sr-only">Toggle sidebar</span>
               </Button>
-              <Image
-                src="/images/vicoa-logo-text.webp"
-                alt="Vicoa Logo"
-                width={0}
-                height={0}
-                sizes="100vw"
-                className="h-6 w-auto ml-2"
-              />
+              <BrandWordmark className="ml-2" />
             </div>
           </div>
         )}
