@@ -67,7 +67,19 @@ if [ "$VICOA_DIRECT_SHOW_TOKEN" = "1" ]; then
   args+=(--show-token)
 fi
 
-nohup "$VICOA_DIRECT_PYTHON" -m vicoa.cli direct "${args[@]}" >"$VICOA_DIRECT_LOG_FILE" 2>&1 &
+# nohup only ignores SIGHUP. When this script is invoked from a terminal or an
+# agent session, teardown may SIGTERM the whole process group. Start the daemon
+# in its own session so it survives that and can be stopped only via its PID.
+detach_python='import os, sys
+try:
+    os.setsid()
+except OSError:
+    pass
+os.execv(sys.argv[1], sys.argv[1:])'
+
+nohup "$VICOA_DIRECT_PYTHON" -c "$detach_python" \
+  "$VICOA_DIRECT_PYTHON" -m vicoa.cli direct "${args[@]}" \
+  >"$VICOA_DIRECT_LOG_FILE" 2>&1 &
 daemon_pid=$!
 echo "$daemon_pid" >"$VICOA_DIRECT_PID_FILE"
 
