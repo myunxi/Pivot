@@ -293,7 +293,7 @@ const MARKDOWN_COMPONENTS: Components = {
     }
 
     if (!isBlock && !text.includes('\n')) {
-      return <code className="text-sm" style={{ color: 'var(--color-inline-code)', fontFamily: CHAT_CODE_FONT_FAMILY }}>{restoredChildren}</code>;
+      return <code className="text-sm" style={{ color: 'var(--color-inline-code)', fontFamily: CHAT_CODE_FONT_FAMILY, overflowWrap: 'anywhere' }}>{restoredChildren}</code>;
     }
 
     // For code blocks, don't add padding as <pre> already has it
