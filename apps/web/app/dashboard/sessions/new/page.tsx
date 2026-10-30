@@ -44,7 +44,7 @@ import { AgentTypeIcon, getAgentLogoSrc } from '@/components/dashboard/agent-typ
 import { PrincipalAvatar } from '@/components/ui/principal-avatar';
 import { SavedAgentItems } from '@/components/dashboard/saved-agent-items';
 import { agentPrincipal, agentProfileBlockedReason } from '@/lib/use-agent-profiles';
-import { ChipDropdown, ModeIcon, PERMISSION_LIST_WIDTH_CLASS, TickItem, modelListWidthClass, modelSublabel } from '@/components/dashboard/session-config-dropdown';
+import { ChipDropdown, ModeIcon, PERMISSION_LIST_WIDTH_CLASS, TickItem } from '@/components/dashboard/session-config-dropdown';
 import { rpcGitStatus, rpcGitWorktreeListWithMain, type WorktreeListing } from '@/components/files-git-panel/rpc';
 import { FilesGitPanel, FilesGitPanelToggle, usePanelState } from '@/components/files-git-panel';
 import {
@@ -634,17 +634,8 @@ function NewSessionContent() {
     [activeAgentDef, sessionConfig.model],
   );
 
-  // Per-model filter: agent-level lists are the superset (labels + order);
-  // opt_in entries only appear when the active model names
-  // them in its per-model array. Common entries are always shown.
-  const visibleThinking: CatalogEnumEntry[] = useMemo(() => {
-    if (!activeAgentDef?.thinking_efforts?.length) return [];
-    const optIns = new Set(activeModelDef?.thinking_efforts ?? []);
-    return activeAgentDef.thinking_efforts.filter((e) => !e.opt_in || optIns.has(e.id));
-  }, [activeAgentDef, activeModelDef]);
-
-  const visibleReasoning: CatalogEnumEntry[] = activeAgentDef?.reasoning_efforts ?? [];
-
+  // Per-model filter: opt_in permission modes only appear when the active model
+  // names them in its per-model array. Common entries are always shown.
   const visiblePermission: CatalogEnumEntry[] = useMemo(() => {
     if (!activeAgentDef?.permission_modes?.length) return [];
     const optIns = new Set(activeModelDef?.permission_modes ?? []);
@@ -2044,7 +2035,6 @@ function NewSessionContent() {
     setSelectedWorktreeBranch(null);
   }, [repoListing, worktreeMode, selectedWorktreePath, machineHomeDir]);
 
-  const modelEntries = activeAgentDef?.models ?? null;
   // Catalog agents (static + the machine's cached extras synthesized into
   // `effectiveCatalog`), plus any the selected machine reports that neither
   // knows. Those are user-defined providers from that machine's
@@ -2555,76 +2545,6 @@ function NewSessionContent() {
                         </>
                       )}
                     </ChipDropdown>
-                    {modelEntries && modelEntries.length > 0 && (
-                      <ChipDropdown
-                        title="Model"
-                        contentClassName={modelListWidthClass(modelEntries)}
-                        chip={
-                          <span className="min-w-0 truncate">
-                            {modelEntries.find((m) => m.id === sessionConfig.model)?.label ?? sessionConfig.model ?? 'Model'}
-                          </span>
-                        }
-                      >
-                        {(close) =>
-                          modelEntries.map((m) => (
-                            <TickItem
-                              key={m.id}
-                              label={m.label}
-                              sublabel={modelSublabel(m)}
-                              isSelected={m.id === sessionConfig.model}
-                              isPending={false}
-                              onClick={() => { updateField({ model: m.id }); close(); }}
-                            />
-                          ))
-                        }
-                      </ChipDropdown>
-                    )}
-                    {visibleThinking.length > 0 && (
-                      <ChipDropdown
-                        title="Effort"
-                        contentClassName="w-44"
-                        chip={
-                          <span className="min-w-0 truncate">
-                            {visibleThinking.find((e) => e.id === sessionConfig.thinking_effort)?.label ?? 'Effort'}
-                          </span>
-                        }
-                      >
-                        {(close) =>
-                          visibleThinking.map((e) => (
-                            <TickItem
-                              key={e.id}
-                              label={e.label}
-                              isSelected={e.id === sessionConfig.thinking_effort}
-                              isPending={false}
-                              onClick={() => { updateField({ thinking_effort: e.id }); close(); }}
-                            />
-                          ))
-                        }
-                      </ChipDropdown>
-                    )}
-                    {visibleReasoning.length > 0 && (
-                      <ChipDropdown
-                        title="Effort"
-                        contentClassName="w-44"
-                        chip={
-                          <span className="min-w-0 truncate">
-                            {visibleReasoning.find((e) => e.id === sessionConfig.reasoning_effort)?.label ?? 'Effort'}
-                          </span>
-                        }
-                      >
-                        {(close) =>
-                          visibleReasoning.map((e) => (
-                            <TickItem
-                              key={e.id}
-                              label={e.label}
-                              isSelected={e.id === sessionConfig.reasoning_effort}
-                              isPending={false}
-                              onClick={() => { updateField({ reasoning_effort: e.id }); close(); }}
-                            />
-                          ))
-                        }
-                      </ChipDropdown>
-                    )}
                     {visiblePermission.length > 0 && (
                       <ChipDropdown
                         title="Permission mode"
