@@ -5,7 +5,7 @@
 const DIRECT_MODE =
   new URL(self.location.href).searchParams.get('direct') === '1';
 
-const CACHE_NAME = 'vicoa-shell-v1';
+const CACHE_NAME = 'vicoa-shell-v2';
 const SHELL_ASSETS = [
   '/offline.html',
   '/manifest.json',
