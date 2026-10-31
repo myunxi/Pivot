@@ -32,7 +32,7 @@ const DIRECT_WS_URL = process.env.NEXT_PUBLIC_DIRECT_WS_URL ?? '';
 
 const DIRECT_APPLE_WEB_APP = {
   capable: true,
-  title: 'Vicoa',
+  title: 'Pivot',
   // Matches the dark app; with viewport-fit auto the page no longer paints
   // under the status bar, so an opaque bar keeps the top edge consistent.
   statusBarStyle: 'black',
@@ -40,7 +40,7 @@ const DIRECT_APPLE_WEB_APP = {
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://vicoa.ai'),
-  title: 'Vicoa - Run & Manage a Team of AI Agents Anywhere',
+  title: 'Pivot - Your pivot from idea to code',
   description: 'Vicoa is an agent-native IDE that lets you orchestrate parallel AI agents like Claude Code, Codex, Gemini, Cursor, and 40+ more on your phone and desktop. Put your coding agents in your pocket and start building from anywhere.',
   icons: [
     { rel: 'icon', url: '/favicon.ico', sizes: 'any' },
@@ -109,15 +109,15 @@ export const metadata: Metadata = {
     type: 'website',
     locale: 'en_US',
     url: 'https://vicoa.ai',
-    siteName: 'Vicoa - Run & Manage a Team of AI Agents Anywhere',
-    title: 'Vicoa - Run & Manage a Team of AI Agents Anywhere',
+    siteName: 'Pivot - Your pivot from idea to code',
+    title: 'Pivot - Your pivot from idea to code',
     description: 'Vicoa is an agent-native IDE that lets you orchestrate parallel AI agents like Claude Code, Codex, Gemini, Cursor, and 40+ more on your phone and desktop. Put your coding agents in your pocket and start building from anywhere.',
     images: [
       {
         url: '/images/vicoa-banner-v2.png',
         width: 1200,
         height: 630,
-        alt: 'Vicoa - Run & Manage a Team of AI Agents Anywhere',
+        alt: 'Pivot - Your pivot from idea to code',
       },
     ],
   },
@@ -125,7 +125,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     site: '@Vicoa',
     creator: '@Vicoa',
-    title: 'Vicoa - Run & Manage a Team of AI Agents Anywhere',
+    title: 'Pivot - Your pivot from idea to code',
     description: 'Vicoa is an agent-native IDE that lets you orchestrate parallel AI agents like Claude Code, Codex, Gemini, Cursor, and 40+ more on your phone and desktop. Put your coding agents in your pocket and start building from anywhere.',
     images: ['/images/vicoa-banner-v2.png'],
   },
