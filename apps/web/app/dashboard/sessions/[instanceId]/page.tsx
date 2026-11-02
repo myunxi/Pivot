@@ -46,6 +46,7 @@ import {
   type TranscriptItem,
 } from '@/components/dashboard/session-transcript';
 import { getChatItemSearchText } from '@/lib/chat-search';
+import { distanceFromBottom, shouldFollowOwnSend } from '@/lib/chat-scroll';
 import { buildForkTranscript, saveForkContext } from '@/lib/fork-session';
 import { loadFullHistory } from '@/lib/fork-history';
 import { FilesGitPanel, FilesGitPanelToggle, OpenInSubMenu, usePanelState, type OpenFileRequest, type PanelPendingAction } from '@/components/files-git-panel';
@@ -955,12 +956,21 @@ function AgentInstanceContent() {
     return echo;
   }, [instanceId, isStreamConnected, fetchInstanceDetail]);
 
-  // Re-arm follow intent and nudge the just-committed row into view. A direct
-  // send expects to watch its message land and the reply stream in, regardless
-  // of where the user was scrolled. The double rAF waits for the store-write
-  // commit + Virtuoso's first re-measure before scrolling — covers the
-  // send-from-up-the-scroll case where there was nothing to follow.
+  // Re-arm follow intent and nudge the just-committed row into view, but only
+  // when the viewport is already near the bottom: sending while the user is
+  // reading history must leave the viewport parked. The double rAF waits for
+  // the store-write commit + Virtuoso's first re-measure before scrolling —
+  // covers the send-from-bottom case where there was nothing to follow.
   const followOwnSend = useCallback(() => {
+    const el = scrollerElRef.current;
+    if (el) {
+      if (!shouldFollowOwnSend(distanceFromBottom(el))) {
+        setFollowBottom(false);
+        return;
+      }
+    } else if (!followBottomRef.current) {
+      return;
+    }
     setFollowBottom(true);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
