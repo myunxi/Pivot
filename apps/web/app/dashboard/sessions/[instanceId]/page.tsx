@@ -102,10 +102,11 @@ import {
   findLatestAgentMode,
   extractThinkingSettingFromMessage,
   findLatestThinkingSetting,
+  findLatestModel,
 } from '@/lib/session-control-messages';
 import { messageSortKey, groupMessagesByDate } from '@/lib/message-grouping';
 import { AGENT_CATALOG_FALLBACK, agentById } from '@/lib/agent-catalog';
-import { extractSessionConfigFromInstance, extractAcpControlsFromInstance } from '@/lib/session-config-utils';
+import { buildModelControlMessage, extractSessionConfigFromInstance, extractAcpControlsFromInstance } from '@/lib/session-config-utils';
 
 // Git diff functionality moved to separate component
 
@@ -310,9 +311,12 @@ function AgentInstanceContent() {
   const [opencodeAgentMode, setOpencodeAgentMode] = useState<OpencodeAgentModeValue | null>(null);
   const [pendingOpencodeAgentMode, setPendingOpencodeAgentMode] = useState<OpencodeAgentModeValue | null>(null);
   const [thinkingSettingEnabled, setThinkingSettingEnabled] = useState<boolean | null>(null);
+  const [confirmedModel, setConfirmedModel] = useState<string | null>(null);
+  const [pendingModel, setPendingModel] = useState<string | null>(null);
   // Optimistic gear selection for ACP agents (cursor/gemini/copilot/kimi/hermes).
-  // Their raw mode ids aren't recognised by the claude/codex echo parsers, so we
-  // apply mode changes optimistically here instead of waiting for an echo.
+  // Their raw model/mode ids aren't recognised by the claude/codex echo parsers,
+  // so we apply changes optimistically here instead of waiting for an echo.
+  const [acpModel, setAcpModel] = useState<string | null>(null);
   const [acpMode, setAcpMode] = useState<string | null>(null);
   // Whether this session was started with an initial prompt (set by the
   // new-session flow via sessionStorage). true → show the "Starting your
@@ -463,7 +467,8 @@ function AgentInstanceContent() {
     const derivedRawPermission = extractControlSettingValue(newMessage.content, 'permission_mode');
     const derivedAgentMode = extractAgentModeFromMessage(newMessage.content);
     const derivedThinking = extractThinkingSettingFromMessage(newMessage.content);
-    const shouldAffectStatus = !derivedMode && !derivedRawPermission && !derivedAgentMode && derivedThinking === null;
+    const derivedModel = extractControlSettingValue(newMessage.content, 'model');
+    const shouldAffectStatus = !derivedMode && !derivedRawPermission && !derivedAgentMode && derivedThinking === null && !derivedModel;
 
     if (isAgentMessage) {
       setIsAgentThinking(false);
@@ -524,6 +529,11 @@ function AgentInstanceContent() {
 
     if (derivedThinking !== null) {
       setThinkingSettingEnabled(prev => (prev === derivedThinking ? prev : derivedThinking));
+    }
+
+    if (derivedModel) {
+      setConfirmedModel(derivedModel);
+      setPendingModel(prev => (prev === derivedModel ? null : prev));
     }
   }, [instanceId, updateInstanceStatus]);
   
@@ -1131,8 +1141,28 @@ function AgentInstanceContent() {
     });
   }, [thinkingSettingEnabled, postMessageToInstance]);
 
-  // ACP mode changes (cursor/gemini/copilot/kimi/hermes) apply optimistically:
-  // move the selection immediately, send the control message, revert on failure.
+  const handleModelChange = useCallback((modelId: string) => {
+    const prev = pendingModel;
+    setPendingModel(modelId);
+    postMessageToInstance(buildModelControlMessage(modelId)).catch((err) => {
+      console.error('Failed to update model:', err);
+      setPendingModel(prev);
+    });
+  }, [pendingModel, postMessageToInstance]);
+
+  // ACP model/mode changes (cursor/gemini/copilot/kimi/hermes) apply
+  // optimistically: move the selection immediately, send the control message,
+  // revert only on failure. Their raw ids never echo back through the
+  // claude/codex confirm path, so the shared handlers' pending spinner would
+  // otherwise hang.
+  const handleAcpModelChange = useCallback((modelId: string) => {
+    setAcpModel(modelId);
+    postMessageToInstance(buildModelControlMessage(modelId)).catch((err) => {
+      console.error('Failed to update model:', err);
+      setAcpModel(null);
+    });
+  }, [postMessageToInstance]);
+
   const handleAcpModeChange = useCallback((modeId: string) => {
     setAcpMode(modeId);
     postMessageToInstance(buildPermissionModeRequestMessage(modeId as PermissionModeValue)).catch((err) => {
@@ -1893,6 +1923,7 @@ function AgentInstanceContent() {
 
   useEffect(() => {
     setInitialPermissionMode(null);
+    setAcpModel(null);
     setAcpMode(null);
     // Read the new-session hint (kept, not consumed, so a refresh while still
     // empty stays consistent). Absent → null → idle "Session ready".
@@ -1934,6 +1965,11 @@ function AgentInstanceContent() {
     if (latestAgentMode) {
       setOpencodeAgentMode(prev => (prev === latestAgentMode ? prev : latestAgentMode));
       setPendingOpencodeAgentMode(prev => (prev === latestAgentMode ? null : prev));
+    }
+    const latestModel = findLatestModel(instance.messages);
+    if (latestModel) {
+      setConfirmedModel(prev => (prev === latestModel ? prev : latestModel));
+      setPendingModel(prev => (prev === latestModel ? null : prev));
     }
     // `instance?.messages` is intentionally NOT a dep — see comment above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2113,11 +2149,21 @@ function AgentInstanceContent() {
   const canShowSessionConfig = isClaudeCodeAgent || isCodexAgent || isOpencodeAgent;
 
   const sessionCatalogAgent = agentById(AGENT_CATALOG_FALLBACK, agentType);
+  const sessionModels = sessionCatalogAgent?.models?.map((m) => ({ id: m.id, label: m.label })) ?? undefined;
+  // Both native agents advertise their machine's real models onto
+  // session_config — codex from its `model/list` RPC (account/version
+  // filtered), claude from the catalog merged with the machine's own slugs
+  // (~/.claude/settings.json + ANTHROPIC_*_MODEL, or a curated
+  // ~/.claude/models.json). Prefer that live list over the static catalog so
+  // the gear shows what the installed agent actually accepts. Falls back to the
+  // catalog before the daemon's first PATCH, or on a CLI too old to report.
+  const nativeLive = (isClaudeCodeAgent || isCodexAgent) ? extractAcpControlsFromInstance(instance) : null;
+  const nativeHasLiveModels = !!nativeLive && nativeLive.models.length > 0;
 
   const sessionPermissionModes = (() => {
     const modes = sessionCatalogAgent?.permission_modes;
     if (!modes?.length) return undefined;
-    const activeModelId = sessionConfigSnapshot.model;
+    const activeModelId = confirmedModel ?? sessionConfigSnapshot.model;
     const activeModel = sessionCatalogAgent?.models?.find((m) => m.id === activeModelId);
     const optIns = new Set(activeModel?.permission_modes ?? []);
     const filtered = modes.filter((m) => !m.opt_in || optIns.has(m.id));
@@ -2174,12 +2220,31 @@ function AgentInstanceContent() {
   const acpModes = (acpLive && acpLive.modes.length > 0)
     ? acpLive.modes
     : acpStaticModes.map((m) => ({ value: m.id, label: m.label }));
+  const acpModels = (acpLive && acpLive.models.length > 0)
+    ? acpLive.models
+    : (acpCatalogAgent?.models?.map((m) => ({ id: m.id, label: m.label })) ?? []);
   const acpDefaultMode = acpStaticModes.find((m) => m.is_default)?.id ?? null;
-  const acpHasControls = acpModes.length > 0;
+  const acpDefaultModel = acpCatalogAgent?.models?.find((m) => m.is_default)?.id ?? acpModels[0]?.id ?? null;
+  const acpHasControls = acpModels.length > 0 || acpModes.length > 0;
 
   // Gear shows for the catalog-driven big-3 and for ACP agents with controls;
   // SessionConfigDropdown self-hides when handed nothing.
   const showGear = canShowSessionConfig || acpHasControls;
+  // Non-claude/codex agents (opencode + ACP) get the single-column scrollable
+  // model list — their model lists can be long or have long ids.
+  const singleColumnModels = !(isClaudeCodeAgent || isCodexAgent);
+
+  // Resolved config-dropdown inputs. ACP agents apply changes optimistically
+  // (handleAcp*) and show no pending spinner — their raw ids never echo back
+  // through the claude/codex confirm path. Big-3 keep the echo-driven pending.
+  const gearModels = canShowSessionConfig
+    ? (nativeHasLiveModels ? nativeLive!.models : sessionModels)
+    : (acpModels.length > 0 ? acpModels : undefined);
+  const gearCurrentModel = canShowSessionConfig
+    ? (confirmedModel ?? sessionConfigSnapshot.model ?? nativeLive?.currentModel ?? undefined)
+    : (acpModel ?? acpLive?.currentModel ?? acpDefaultModel);
+  const gearPendingModel = isAcpAgent ? null : pendingModel;
+  const gearOnModelChange = isAcpAgent ? handleAcpModelChange : (canShowSessionConfig ? handleModelChange : undefined);
 
   const gearPermissionModes = canShowSessionConfig ? sessionPermissionModes : (acpModes.length > 0 ? acpModes : undefined);
   // The message scan is authoritative for live switches, but a session that
@@ -2881,6 +2946,11 @@ function AgentInstanceContent() {
                       ? "This session's agent isn't running. Only its owner can resume it."
                       : (chatLiveStateHint ?? undefined)
                 }
+                sessionModels={gearModels}
+                currentModel={gearCurrentModel}
+                pendingModel={gearPendingModel}
+                onModelChange={isOwner ? gearOnModelChange : undefined}
+                singleColumnModels={singleColumnModels}
                 usage={instance.instance_metadata?.usage ?? null}
                 queuedItems={queuedItems}
                 canSteer={canSteer}

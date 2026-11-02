@@ -258,7 +258,7 @@ export interface SessionUsageWindow {
 
 /** GET /machines/{id}/agent-models — see `getMachineAgentModels`. */
 export interface MachineAgentModelsCache {
-  models: Record<string, { id: string; label: string }[]>;
+  models: Record<string, { id: string; label: string; is_default?: boolean }[]>;
   modes: Record<string, { id: string; label: string }[]>;
 }
 
@@ -1889,7 +1889,7 @@ class BackendAPI {
    */
   async getMachineAgentModels(machineId: string): Promise<MachineAgentModelsCache> {
     const resp = await this.request<{
-      agent_models?: Record<string, { id: string; label: string }[]>;
+      agent_models?: Record<string, { id: string; label: string; is_default?: boolean }[]>;
       agent_modes?: Record<string, { id: string; label: string }[]>;
     }>(`/api/v1/machines/${machineId}/agent-models`);
     return { models: resp.agent_models ?? {}, modes: resp.agent_modes ?? {} };

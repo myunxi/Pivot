@@ -78,6 +78,38 @@ describe('catalogWithCachedModels', () => {
     expect(models?.find((m) => m.id === 'my-org/custom-sonnet')?.default_thinking_effort).toBeUndefined();
   });
 
+  test('a curated default on a known model beats the catalog default', () => {
+    // ~/.claude/models.json names the machine's default explicitly. When that
+    // id is also in the static catalog, the curated marker must win — otherwise
+    // the catalog's own `is_default` (Sonnet 5) would stay ticked.
+    const merged = catalogWithCachedModels(AGENT_CATALOG_FALLBACK, {
+      claude: [
+        { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+        { id: 'claude-opus-4-8', label: 'Opus 4.8', is_default: true },
+      ],
+    });
+    const models = merged.agents.find((a) => a.id === 'claude')?.models;
+    expect(models?.map((m) => m.id)).toEqual(['claude-sonnet-5', 'claude-opus-4-8']);
+    expect(models?.find((m) => m.id === 'claude-opus-4-8')?.is_default).toBe(true);
+    expect(models?.find((m) => m.id === 'claude-sonnet-5')?.is_default).toBeFalsy();
+    expect(defaultsFor(merged, 'claude').model).toBe('claude-opus-4-8');
+  });
+
+  test('a curated default on a custom slug suppresses the defer sentinel', () => {
+    // The curated list is the whole picker: a custom default (deepseek-flash)
+    // must be the selected model new sessions start in, not the synthetic
+    // `auto`/`default` entry.
+    const merged = catalogWithCachedModels(AGENT_CATALOG_FALLBACK, {
+      claude: [{ id: 'deepseek-flash', label: 'deepseek-flash', is_default: true }],
+    });
+    const claude = merged.agents.find((a) => a.id === 'claude');
+    expect(claude?.models?.map((m) => m.id)).toEqual(['deepseek-flash']);
+    expect(claude?.models?.[0].is_default).toBe(true);
+    const defaults = defaultsFor(merged, 'claude');
+    expect(defaults.model).toBe('deepseek-flash');
+    expect(toSpawnMetadata(defaults).model).toBe('deepseek-flash');
+  });
+
   test('a Claude model the catalog predates still gets auto mode', () => {
     // `auto` is common, not opt_in, so a model shipped after this build (only
     // known from the machine's reported list) offers and defaults to it.

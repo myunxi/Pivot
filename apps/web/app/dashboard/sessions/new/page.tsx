@@ -44,7 +44,14 @@ import { AgentTypeIcon, getAgentLogoSrc } from '@/components/dashboard/agent-typ
 import { PrincipalAvatar } from '@/components/ui/principal-avatar';
 import { SavedAgentItems } from '@/components/dashboard/saved-agent-items';
 import { agentPrincipal, agentProfileBlockedReason } from '@/lib/use-agent-profiles';
-import { ChipDropdown, ModeIcon, PERMISSION_LIST_WIDTH_CLASS, TickItem } from '@/components/dashboard/session-config-dropdown';
+import {
+  ChipDropdown,
+  ModeIcon,
+  PERMISSION_LIST_WIDTH_CLASS,
+  TickItem,
+  modelListWidthClass,
+  modelSublabel,
+} from '@/components/dashboard/session-config-dropdown';
 import { rpcGitStatus, rpcGitWorktreeListWithMain, type WorktreeListing } from '@/components/files-git-panel/rpc';
 import { FilesGitPanel, FilesGitPanelToggle, usePanelState } from '@/components/files-git-panel';
 import {
@@ -139,6 +146,17 @@ const MACHINE_REFRESH_INTERVAL_MS = 30_000;
 const IS_DIRECT_WEB = process.env.NEXT_PUBLIC_VICOA_DIRECT === '1';
 
 const EMPTY_AGENT_MODELS_CACHE: MachineAgentModelsCache = { models: {}, modes: {} };
+
+/** Field-wise equality for reconciled configs, so a heartbeat-driven catalog
+ *  refresh (new object identity, same contents) does not churn React state. */
+function sameSessionConfig(a: SessionConfig, b: SessionConfig): boolean {
+  return a.agent === b.agent
+    && a.model === b.model
+    && a.thinking_effort === b.thinking_effort
+    && a.reasoning_effort === b.reasoning_effort
+    && a.permission_mode === b.permission_mode
+    && a.opencode_mode === b.opencode_mode;
+}
 
 /** One attachment picked before the session exists: preview now, upload later.
  *
@@ -642,6 +660,8 @@ function NewSessionContent() {
     return activeAgentDef.permission_modes.filter((e) => !e.opt_in || optIns.has(e.id));
   }, [activeAgentDef, activeModelDef]);
 
+  const visibleModels: CatalogModel[] = activeAgentDef?.models ?? [];
+
   const visibleModes: CatalogEnumEntry[] = activeAgentDef?.modes ?? [];
 
   // Shared with the session list and the backend's own threshold — see
@@ -752,19 +772,21 @@ function NewSessionContent() {
     return () => { cancelled = true; };
   }, [api, selectedMachineId]);
 
-  // An agent picked before its cache arrived (a catalog-added agent the
-  // auto-probe below is still filling in) has a config with no model at all,
-  // so its chips would read "Model" / "Mode" with nothing selected once the
-  // lists land. Fill in the defaults the moment the effective catalog can
-  // describe it; agents the static catalog knows always have a model already.
+  // Reconcile every config against the effective catalog once a machine's real
+  // model lists land. Besides filling in a config with no model at all (a
+  // catalog-added agent the auto-probe below is still describing), this is what
+  // makes the curated `~/.claude/models.json` default stick: a model persisted
+  // from an older catalog, or absent from the curated list, falls back to the
+  // entry marked `is_default`. A model the user picked that is still listed is
+  // preserved — reconcileAgainst only replaces unknown ids.
   useEffect(() => {
     setPerAgentConfigs((prev) => {
       let next = prev;
       for (const [id, config] of Object.entries(prev)) {
-        if (config.model !== undefined) continue;
-        if (!agentById(effectiveCatalog, id)?.models?.length) continue;
+        const reconciled = reconcileAgainst(config, effectiveCatalog);
+        if (sameSessionConfig(config, reconciled)) continue;
         if (next === prev) next = { ...prev };
-        next[id] = reconcileAgainst(config, effectiveCatalog);
+        next[id] = reconciled;
       }
       return next;
     });
@@ -2545,6 +2567,35 @@ function NewSessionContent() {
                         </>
                       )}
                     </ChipDropdown>
+                    {visibleModels.length > 0 && (
+                      <ChipDropdown
+                        title="Model"
+                        contentClassName={modelListWidthClass(visibleModels)}
+                        chip={
+                          <>
+                            <AgentTypeIcon agentTypeName={sessionConfig.agent} size={12} whiteForOpenAI />
+                            <span className="min-w-0 truncate">
+                              {visibleModels.find((m) => m.id === sessionConfig.model)?.label
+                                ?? sessionConfig.model
+                                ?? 'Model'}
+                            </span>
+                          </>
+                        }
+                      >
+                        {(close) =>
+                          visibleModels.map((m) => (
+                            <TickItem
+                              key={m.id}
+                              label={m.label}
+                              sublabel={modelSublabel(m)}
+                              isSelected={m.id === sessionConfig.model}
+                              isPending={false}
+                              onClick={() => { updateField({ model: m.id }); close(); }}
+                            />
+                          ))
+                        }
+                      </ChipDropdown>
+                    )}
                     {visiblePermission.length > 0 && (
                       <ChipDropdown
                         title="Permission mode"

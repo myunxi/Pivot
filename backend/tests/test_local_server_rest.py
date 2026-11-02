@@ -583,7 +583,22 @@ def test_agent_catalog_served_with_etag(client: TestClient) -> None:
     assert cached.status_code == 304
 
 
-def test_machine_agent_models_empty(client: TestClient) -> None:
+def test_machine_agent_models_curated(client: TestClient, monkeypatch) -> None:
+    curated = [{"id": "deepseek-v4.1-flash", "label": "deepseek-flash-4.1", "is_default": True}]
+    monkeypatch.setattr(
+        "integrations.headless.claude_model_catalog.build_claude_available_models",
+        lambda: curated,
+    )
+    response = client.get("/api/v1/machines/local/agent-models", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {"agent_models": {"claude": curated}}
+
+
+def test_machine_agent_models_empty_without_claude_models(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "integrations.headless.claude_model_catalog.build_claude_available_models",
+        lambda: [],
+    )
     response = client.get("/api/v1/machines/local/agent-models", headers=AUTH)
     assert response.status_code == 200
     assert response.json() == {"agent_models": {}}

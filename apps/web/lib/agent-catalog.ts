@@ -126,10 +126,12 @@ export function normalizeModelLabel(id: string, label: string): string {
   return label.endsWith(suffix) ? label.slice(0, -suffix.length) : label;
 }
 
-/** One cached `{id, label}` entry as the machine's `machine_agent_models` row stores it. */
+/** One cached entry as the machine's `machine_agent_models` row stores it. */
 export interface CachedAgentEntry {
   id: string;
   label: string;
+  /** Marks the model new sessions should default to (curated `~/.claude/models.json`). */
+  is_default?: boolean;
 }
 
 /**
@@ -208,19 +210,32 @@ export function catalogWithCachedModels(
       // Genuinely custom ids (a user's ANTHROPIC_MODEL slug, an ACP variant)
       // keep the common set only.
       const catalogById = new Map((a.models ?? []).map((m) => [m.id, m] as const));
+      // A curated list (~/.claude/models.json) names its own default. Make that
+      // entry the only `is_default` so a known id can't keep the catalog's
+      // marker (Sonnet 5) and win `find(is_default)` instead.
+      const cachedDefaultId = cached.find((m) => m.is_default)?.id;
       const cachedModels: CatalogModel[] = cached.map((m) => {
         const known = catalogById.get(m.id);
         const label = normalizeModelLabel(m.id, m.label || m.id);
-        return known ? { ...known, label: m.label ? label : known.label } : { id: m.id, label };
+        const base: CatalogModel = known
+          ? { ...known, label: m.label ? label : known.label }
+          : { id: m.id, label };
+        if (!cachedDefaultId) return base;
+        return m.id === cachedDefaultId
+          ? { ...base, is_default: true }
+          : { ...base, is_default: undefined };
       });
       // Keep the agent's "defer to its own model" sentinel (the is_default
-      // catalog entry, e.g. `auto`/`default`) at the top of the list. The
-      // cached list is the machine's *real* models and never includes that
-      // synthetic id, so without this a stored default would no longer match
-      // any entry — the picker would render "—" and the spawn would lose the
-      // defer behaviour (toSpawnMetadata skips sending a model for auto/default).
+      // catalog entry, e.g. `auto`/`default`) at the top of the list — unless
+      // the cached list already names a default (a curated `~/.claude/models.json`
+      // does), in which case that default must win so new sessions start there.
+      // The cached list is the machine's *real* models and never includes the
+      // synthetic id, so without the sentinel a stored default would no longer
+      // match any entry — the picker would render "—" and the spawn would lose
+      // the defer behaviour (toSpawnMetadata skips sending a model for auto/default).
       const sentinel = a.models?.find((m) => m.is_default);
-      const models = sentinel && !cachedModels.some((m) => m.id === sentinel.id)
+      const hasCachedDefault = cachedModels.some((m) => m.is_default);
+      const models = sentinel && !hasCachedDefault && !cachedModels.some((m) => m.id === sentinel.id)
         ? [{ ...sentinel }, ...cachedModels]
         : cachedModels;
       return cachedModes ? { ...a, models, permission_modes: cachedModes } : { ...a, models };

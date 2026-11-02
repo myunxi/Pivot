@@ -852,16 +852,25 @@ def create_local_app(
 
     @app.get("/api/v1/machines/{machine_id}/agent-models")
     def get_machine_agent_models(request: Request, machine_id: str) -> dict:
-        """Cached per-agent ACP model lists for a machine.
+        """Cached per-agent model lists for a machine.
 
-        There is no local ACP model cache, so this is always the empty
-        ``{"agent_models": {}}`` shape (matches
-        backend.api.machines MachineAgentModelsResponse). The renderer falls
-        back to the catalog's default models, which is the correct behaviour
-        until an ACP agent has actually run here.
+        Reports Claude's real list (``~/.claude/models.json`` when present,
+        else catalog + custom slugs) under ``agent_models.claude``. Other agents
+        have no local discovery, so they stay absent and the renderer falls back
+        to the catalog — the same shape as
+        ``backend.api.machines.MachineAgentModelsResponse``.
         """
         require_nonce(request)
-        return {"agent_models": {}}
+        try:
+            from integrations.headless.claude_model_catalog import (
+                build_claude_available_models,
+            )
+
+            claude_models = build_claude_available_models()
+        except Exception:
+            logger.warning("agent-models: claude discovery failed", exc_info=True)
+            claude_models = []
+        return {"agent_models": {"claude": claude_models} if claude_models else {}}
 
     # ------------------------------------------------------------------
     # Auth + billing stubs (renderer parity in local-only mode)
