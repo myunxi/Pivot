@@ -23,6 +23,7 @@ import {
   Cog,
   BookOpen,
   Bot,
+  FileCode2,
   Layers2,
   Link2,
   X,
@@ -31,6 +32,7 @@ import {
   Flag,
   PanelLeft,
   Search,
+  Send,
   Settings,
 } from 'lucide-react';
 import { PrincipalAvatar } from '@/components/ui/principal-avatar';
@@ -38,6 +40,7 @@ import { AccountPlanItem } from '@/components/billing/account-plan-item';
 import { UpgradeDialog } from '@/components/billing/upgrade-dialog';
 import { MENU_MAX_AGE_MS, refreshBillingSubscriptionIfOlderThan } from '@/lib/billing-subscription';
 import { AccountMenuInvitations, InvitationDot } from '@/components/dashboard/account-menu-invitations';
+import { RulesEditorDialog } from '@/components/dashboard/rules-editor-dialog';
 import { AgentDashboardProvider, useAgentDashboard } from '@/lib/contexts/agent-dashboard-context';
 import useSWR from 'swr';
 import type { AuthUser } from '@/lib/auth/user';
@@ -136,6 +139,7 @@ function DashboardSidebar({
   useEffect(() => {
     setSearchKeycaps(comboKeycaps(getShortcutCombo('open-search')));
   }, []);
+  const [rulesEditorOpen, setRulesEditorOpen] = useState(false);
 
   // Archiving/deleting a session tears its terminals + persisted layout down;
   // the shared session list invokes this after the operation completes.
@@ -267,6 +271,8 @@ function DashboardSidebar({
       router.push('/dashboard/agents');
     } else if (tab === 'skills') {
       router.push('/dashboard/skills');
+    } else if (tab === 'dispatch') {
+      router.push('/dashboard/dispatch');
     }
     onMobileClose();
   }, [router, onMobileClose]);
@@ -402,6 +408,25 @@ function DashboardSidebar({
                 New Session
               </Button>
             )
+          )}
+
+          {/* Manual dispatch: event types -> Pivot rules -> agent sessions.
+              Direct mode has no cloud automations, so this is its entry. */}
+          {IS_DIRECT_WEB && (
+            <Button
+              variant="subtle"
+              className={cn(
+                !showSideBar
+                  ? "h-9 w-9 justify-center rounded-lg px-0 bg-transparent"
+                  : "w-full justify-start h-auto py-1.5 mt-1 text-xs",
+                showSideBar && activeTab === 'dispatch' && sidebarItemSelected
+              )}
+              onClick={() => handleTabClick('dispatch')}
+              title="Dispatch"
+            >
+              <Send className={cn("h-4 w-4", showSideBar && "mr-2")} />
+              {showSideBar ? 'Dispatch' : null}
+            </Button>
           )}
 
           {/* Kanban lives in the Workspaces row (shared list) when expanded; the
@@ -668,6 +693,15 @@ function DashboardSidebar({
                       </Link>
                     </DropdownMenuItem>
                   )}
+                  {IS_DIRECT_WEB && (
+                    <DropdownMenuItem
+                      className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
+                      onSelect={() => setRulesEditorOpen(true)}
+                    >
+                      <FileCode2 className="h-4 w-4" />
+                      <span>Edit rules.json</span>
+                    </DropdownMenuItem>
+                  )}
                   {!IS_DIRECT_WEB && (
                     <DropdownMenuItem
                       className="cursor-pointer px-4 py-2.5 text-xs text-foreground/80"
@@ -755,6 +789,13 @@ function DashboardSidebar({
       )}
 
     </aside>
+
+    {IS_DIRECT_WEB && (
+      <RulesEditorDialog
+        open={rulesEditorOpen}
+        onOpenChange={setRulesEditorOpen}
+      />
+    )}
     </>
   );
 }
@@ -1104,6 +1145,9 @@ export default function DashboardLayout({
       setSelectedInstanceId(null);
     } else if (pathname === '/dashboard/agents') {
       setActiveTab('agents');
+      setSelectedInstanceId(null);
+    } else if (pathname === '/dashboard/dispatch') {
+      setActiveTab('dispatch');
       setSelectedInstanceId(null);
     } else if (pathname === '/dashboard/sessions/new') {
       setActiveTab('session');
