@@ -27,7 +27,10 @@ export type SearchableChatItem =
   | { type: 'thinking' }
   | { type: 'message'; message: MessageResponse }
   | { type: 'tool-group'; messages: MessageResponse[] }
-  | { type: 'subagent-group'; messages: MessageResponse[]; subagentType: string; description: string };
+  | { type: 'subagent-group'; messages: MessageResponse[]; subagentType: string; description: string }
+  // Folded-turn summary rows carry no text of their own; expanded children are
+  // searched individually once the find pass walks display items (see §7).
+  | { type: 'turn-activity' };
 
 /**
  * Everything one message contributes to find: its visible prose, plus — for a
@@ -69,4 +72,27 @@ export function getChatItemSearchText(item: SearchableChatItem, agentType: ToolU
 /** True when `text` contains `needle` (already lowercased, non-empty). */
 export function matchesNeedle(text: string, needle: string): boolean {
   return needle !== '' && text.toLowerCase().includes(needle);
+}
+
+/**
+ * The rows find may match. Tool and sub-agent groups stay searchable while
+ * collapsed (their text is rendered on expand, and stepping to a hit opens
+ * them); a folded turn contributes nothing until the reader expands it, so the
+ * counter never promises a hit that is not on screen. Expanded folds flatten
+ * back to their children, keeping each child's original key.
+ */
+export function getItemsInSearchScope<T extends { key: string }>(
+  items: readonly T[],
+  isExpanded: (key: string) => boolean,
+): T[] {
+  const out: T[] = [];
+  for (const item of items) {
+    const fold = item as T & { type?: string; items?: readonly T[] };
+    if (fold.type === 'turn-activity') {
+      if (isExpanded(fold.key) && fold.items) out.push(...fold.items);
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
 }

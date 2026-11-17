@@ -19,7 +19,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { ArrowDown, Loader2 } from 'lucide-react';
+import { ArrowDown, ListChecks, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { MessageResponse, PrincipalResponse } from '@/lib/backend-api';
 import { groupMessagesByDate, messageSortKey } from '@/lib/message-grouping';
@@ -40,25 +40,16 @@ import { parseAskUserQuestionPayload, type AskUserQuestionSubmitPayload } from '
 import { parseThinkingPayload } from '@/components/dashboard/thinking-card';
 import { isPendingQueueStatus, parseQueuePayload } from '@/components/dashboard/queue-status';
 import { FileLinkProvider } from '@/components/dashboard/file-link-context';
+import {
+  isUserMessage,
+  turnActivityLabel,
+  type TranscriptItem,
+} from '@/lib/turn-folding';
 
-export type TranscriptItem =
-  | { type: 'separator'; date: string; key: string }
-  | { type: 'message'; message: MessageResponse; key: string }
-  | { type: 'tool-group'; messages: MessageResponse[]; key: string }
-  | {
-      type: 'subagent-group';
-      messages: MessageResponse[];
-      subagentType: string;
-      description: string;
-      key: string;
-    }
-  | { type: 'thinking'; key: string };
-
-const USER_SENDER_TYPES = new Set(['user', 'human', 'USER', 'HUMAN']);
-
-export function isUserMessage(message: MessageResponse): boolean {
-  return USER_SENDER_TYPES.has(message.sender_type);
-}
+// The item union and `isUserMessage` live in `lib/turn-folding.ts` (the fold
+// pass needs them); re-export so existing importers keep their entry point.
+export { isUserMessage };
+export type { TranscriptItem };
 
 /**
  * Flatten date groups into Virtuoso rows. Keys are stable per item (separators
@@ -113,7 +104,7 @@ export function buildTranscriptItems(
         parseThinkingPayload(msg) !== null;
       const isToolUse =
         !isInteractive &&
-        !USER_SENDER_TYPES.has(msg.sender_type) &&
+        !isUserMessage(msg) &&
         parseToolUse(msg.content, itemsAgentType) !== null;
       if (isToolUse) {
         toolRun.push(msg);
@@ -142,7 +133,7 @@ export function computeTranscriptTurns(items: TranscriptItem[]): Map<string, str
   for (const item of items) {
     if (item.type !== 'message') continue;
     const text = getMessageVisibleText(item.message);
-    const kind: TurnMessageEntry['kind'] = USER_SENDER_TYPES.has(item.message.sender_type)
+    const kind: TurnMessageEntry['kind'] = isUserMessage(item.message)
       ? 'user'
       : parseThinkingPayload(item.message) || isToolUseContent(text)
         ? 'other'
@@ -155,7 +146,11 @@ export function computeTranscriptTurns(items: TranscriptItem[]): Map<string, str
 /** Whether a list has any real message rows (a lone thinking item doesn't count). */
 export function hasTranscriptMessages(items: TranscriptItem[]): boolean {
   return items.some(
-    (it) => it.type === 'message' || it.type === 'tool-group' || it.type === 'subagent-group',
+    (it) =>
+      it.type === 'message' ||
+      it.type === 'tool-group' ||
+      it.type === 'subagent-group' ||
+      it.type === 'turn-activity',
   );
 }
 
@@ -222,6 +217,8 @@ export interface TranscriptRowProps {
   turnCopyText?: ReadonlyMap<string, string>;
   /** This row's padding, from `computeTranscriptSpacing`. */
   spacing: RowSpacing | undefined;
+  /** A folded turn's child: render inside the fold, without the page-width shell. */
+  nested?: boolean;
   /**
    * Who opens each run of prompts, by message id (see `transcriptBylines`).
    * Only a session with more than one writer has any (collaboration §8.2).
@@ -249,20 +246,86 @@ export function TranscriptRow({
   turnCopyText,
   spacing,
   bylines,
+  nested = false,
 }: TranscriptRowProps) {
   const agentType = resolveAgentType(agentTypeName || undefined);
-  const shellStyle = { paddingTop: spacing?.top, paddingBottom: spacing?.bottom };
+  const rowShell = nested ? 'flow-root' : ROW_SHELL;
+  const shellStyle = nested
+    ? undefined
+    : { paddingTop: spacing?.top, paddingBottom: spacing?.bottom };
   if (item.type === 'separator') {
     return (
-      <div className={ROW_SHELL} style={shellStyle}>
+      <div className={rowShell} style={shellStyle} data-transcript-key={item.key}>
         <DateSeparator date={item.date} />
       </div>
     );
   }
   if (item.type === 'thinking') {
     return (
-      <div className={ROW_SHELL} style={shellStyle}>
+      <div className={rowShell} style={shellStyle} data-transcript-key={item.key}>
         <ThinkingIndicator vibingMessage={vibingMessage} />
+      </div>
+    );
+  }
+  if (item.type === 'turn-activity') {
+    const expanded = expandedKeys.has(item.key);
+    // The footer's vibing text is the activity word ("Smooshing…"); fold it
+    // into the label so running turns show what they are doing right now.
+    const activityText =
+      item.live && vibingMessage !== 'Working' ? vibingMessage : null;
+    return (
+      <div
+        className={rowShell}
+        style={shellStyle}
+        data-transcript-key={item.key}
+      >
+        <div className="flex justify-start">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => onToggleExpanded(item.key)}
+            className={`flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground ${
+              findActiveKey === item.key
+                ? 'find-active-message ring-2 ring-amber-400 dark:ring-amber-500'
+                : ''
+            }`}
+          >
+            {item.live ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            ) : (
+              <ListChecks className="h-3.5 w-3.5 shrink-0" />
+            )}
+            <span className="truncate">{turnActivityLabel(item, activityText)}</span>
+            {!item.complete && (
+              <span className="shrink-0">· no final answer</span>
+            )}
+          </button>
+        </div>
+        {expanded && (
+          <div className="mt-1">
+            {item.items.map((child) => (
+              <TranscriptRow
+                key={child.key}
+                item={child}
+                agentTypeName={agentTypeName}
+                projectPath={projectPath}
+                expandedKeys={expandedKeys}
+                onToggleExpanded={onToggleExpanded}
+                findActiveKey={findActiveKey}
+                vibingMessage={vibingMessage}
+                onOptionClick={onOptionClick}
+                onAskUserQuestionSubmit={onAskUserQuestionSubmit}
+                onAskUserQuestionCancel={onAskUserQuestionCancel}
+                onFork={onFork}
+                forkingMessageId={forkingMessageId}
+                turnCopyText={turnCopyText}
+                spacing={undefined}
+                bylines={bylines}
+                nested
+              />
+            ))}
+          </div>
+        )}
       </div>
     );
   }
@@ -271,7 +334,7 @@ export function TranscriptRow({
   }`;
   if (item.type === 'tool-group') {
     return (
-      <div className={ROW_SHELL} style={shellStyle}>
+      <div className={rowShell} style={shellStyle} data-transcript-key={item.key}>
         <div className="flex justify-start">
           <div className={groupShell}>
             <ToolUseGroup
@@ -288,7 +351,7 @@ export function TranscriptRow({
   }
   if (item.type === 'subagent-group') {
     return (
-      <div className={ROW_SHELL} style={shellStyle}>
+      <div className={rowShell} style={shellStyle} data-transcript-key={item.key}>
         <div className="flex justify-start">
           <div className={groupShell}>
             <SubagentGroup
@@ -317,7 +380,7 @@ export function TranscriptRow({
     );
   }
   return (
-    <div className={ROW_SHELL} style={shellStyle}>
+    <div className={rowShell} style={shellStyle} data-transcript-key={item.key}>
       <MessageItem
         message={item.message}
         onOptionClick={onOptionClick}
@@ -355,7 +418,7 @@ export function useExpandedTranscriptKeys(): [Set<string>, (key: string) => void
  */
 export function orderTranscriptMessages(messages: MessageResponse[]): MessageResponse[] {
   const visible = messages.filter((m) => {
-    if (!USER_SENDER_TYPES.has(m.sender_type)) return true;
+    if (!isUserMessage(m)) return true;
     const status = parseQueuePayload(m)?.status;
     if (status === 'cancelled') return false;
     if (isInterruptControlMessage(m.content || '')) return true;
@@ -398,6 +461,8 @@ function itemMessageIds(item: TranscriptItem): string[] {
     case 'tool-group':
     case 'subagent-group':
       return item.messages.map((m) => m.id);
+    case 'turn-activity':
+      return item.items.flatMap(itemMessageIds);
     default:
       return [];
   }

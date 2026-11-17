@@ -45,7 +45,14 @@ import {
   TranscriptRow,
   type TranscriptItem,
 } from '@/components/dashboard/session-transcript';
-import { getChatItemSearchText } from '@/lib/chat-search';
+import { getChatItemSearchText, getItemsInSearchScope } from '@/lib/chat-search';
+import {
+  buildDisplayIndexByKey,
+  foldSettledTurns,
+  hasLiveFold,
+  isFoldedTurnChild,
+  turnIsLive,
+} from '@/lib/turn-folding';
 import { distanceFromBottom, shouldFollowOwnSend } from '@/lib/chat-scroll';
 import { buildForkTranscript, saveForkContext } from '@/lib/fork-session';
 import { loadFullHistory } from '@/lib/fork-history';
@@ -195,6 +202,66 @@ const REATTACH_PX = 8;
 // "at the bottom". Genuine new content (a streamed message) exceeds this and is
 // still followed.
 const STICK_TOLERANCE_PX = 72;
+
+const FIND_SCROLL_TOLERANCE_PX = 6;
+// ~400ms at 60fps: enough for Virtuoso to finish measuring tall, previously
+// unmeasured rows that shift the target out from under the first scroll.
+const FIND_SCROLL_MAX_FRAMES = 24;
+
+/**
+ * Scroll the row carrying `itemKey` to the middle of the viewport.
+ *
+ * A folded turn renders as ONE Virtuoso row that can be thousands of pixels
+ * tall, so `scrollToIndex` can only centre the fold, not the hit inside it.
+ * Folding rows carry `data-transcript-key` (nested children included), so we
+ * look the row up by key — never by `.find-active-message`: when stepping to
+ * the next hit, `setFindActive` has not moved that class until the next
+ * render, so a class query would find the previous hit. Prefer the highlighted
+ * inner element (a message's prose) but fall back to the row shell (a group's
+ * highlight sits on the shell).
+ *
+ * A single `scrollIntoView` is not enough while tall rows are still being
+ * measured: the layout can settle hundreds or thousands of pixels away from
+ * where the hit was placed, leaving it outside the viewport. So the scroll is
+ * followed by a bounded re-check — while the row's centre drifts it is
+ * re-centred, and the loop stops once two consecutive frames agree or the
+ * frame budget runs out. Returns false (without retrying) when the row is not
+ * mounted at all, so the caller can mount it with `scrollToIndex` first.
+ */
+function scrollFindHitIntoView(itemKey: string): boolean {
+  if (typeof document === 'undefined') return true;
+  const selector = `[data-transcript-key="${CSS.escape(itemKey)}"]`;
+  const row = document.querySelector<HTMLElement>(selector);
+  if (!row) return false;
+  const viewport = document.querySelector<HTMLElement>(
+    '[data-virtuoso-scroller="true"]',
+  );
+
+  const settle = (frame: number, stableFrames: number) => {
+    const current = document.querySelector<HTMLElement>(selector);
+    // Unmounted by Virtuoso mid-loop: leave it to the caller's index scroll.
+    if (!current) return;
+    const target = current.matches('.find-active-message')
+      ? current
+      : (current.querySelector<HTMLElement>('.find-active-message') ?? current);
+    const rect = target.getBoundingClientRect();
+    const centre = rect.top + rect.height / 2;
+    const viewportRect = viewport?.getBoundingClientRect();
+    const delta = viewportRect
+      ? centre - (viewportRect.top + viewportRect.height / 2)
+      : centre - window.innerHeight / 2;
+    if (Math.abs(delta) <= FIND_SCROLL_TOLERANCE_PX) {
+      if (stableFrames + 1 >= 2 || frame >= FIND_SCROLL_MAX_FRAMES) return;
+      requestAnimationFrame(() => settle(frame + 1, stableFrames + 1));
+      return;
+    }
+    target.scrollIntoView({ block: 'center' });
+    if (frame >= FIND_SCROLL_MAX_FRAMES) return;
+    requestAnimationFrame(() => settle(frame + 1, 0));
+  };
+  settle(0, 0);
+  return true;
+}
 
 function AgentInstanceContent() {
   const params = useParams();
@@ -1574,14 +1641,32 @@ function AgentInstanceContent() {
   // Header/footer are module-level components; what they show comes through
   // Virtuoso's `context` prop instead of closures.
   const showVibing = showThinking && thinkingSettingEnabled !== false;
-  const virtuosoContext = useMemo<TranscriptListContext>(
-    () => ({ loadingOlder: hasOlderMessages || isLoadingOlder, vibing: showVibing ? vibingMessage : null }),
-    [hasOlderMessages, isLoadingOlder, showVibing, vibingMessage],
-  );
 
   const chatItems = useMemo<ChatItem[]>(
     () => buildTranscriptItems(groupedMessages, { agentTypeName: instance?.agent_type_name }),
     [groupedMessages, instance?.agent_type_name],
+  );
+
+  // Settled turns collapse to one summary row; the active turn keeps its
+  // newest row visible. `showThinking` is the debounced "agent is producing"
+  // signal — never session status (see lib/turn-folding.ts).
+  const turnInProgress = turnIsLive({
+    agentThinking: showThinking,
+    status: instance?.status,
+  });
+  const displayItems = useMemo(
+    () => foldSettledTurns(chatItems, { liveTurn: turnInProgress }),
+    [chatItems, turnInProgress],
+  );
+  // A live fold already says "Working · N steps"; don't repeat it in the footer.
+  const liveFoldVisible = useMemo(() => hasLiveFold(displayItems), [displayItems]);
+
+  const virtuosoContext = useMemo<TranscriptListContext>(
+    () => ({
+      loadingOlder: hasOlderMessages || isLoadingOlder,
+      vibing: showVibing && !liveFoldVisible ? vibingMessage : null,
+    }),
+    [hasOlderMessages, isLoadingOlder, showVibing, liveFoldVisible, vibingMessage],
   );
 
   // Avatar + name over the first prompt of each run by one person, in a
@@ -1594,12 +1679,12 @@ function AgentInstanceContent() {
   // messages so it sees exactly what renders — anything folded into a
   // tool-group or a thinking card is inside the turn but never anchors it.
   const turnCopyText = useMemo(() => computeTranscriptTurns(chatItems), [chatItems]);
-  const rowSpacing = useMemo(() => computeTranscriptSpacing(chatItems), [chatItems]);
+  const rowSpacing = useMemo(() => computeTranscriptSpacing(displayItems), [displayItems]);
 
   // Whether the list has any real message rows. We render the SessionEmptyState
   // (not the virtual list) until a real message arrives, so the Virtuoso-tied
   // overlays/buttons gate on this too.
-  const hasMessageItems = hasTranscriptMessages(chatItems);
+  const hasMessageItems = hasTranscriptMessages(displayItems);
 
   // Expanded tool rows/groups (and subagent-groups — same key-space, no
   // collision since their keys are prefixed distinctly: 'tools-'/message id
@@ -1617,11 +1702,12 @@ function AgentInstanceContent() {
 
   // --- Find in conversation -------------------------------------------------
   // Client-side find over the LOADED transcript. Native ⌘F / findInPage only
-  // sees Virtuoso's rendered rows; this searches the in-memory message array
-  // and uses scrollToIndex to reach off-screen hits. Matches are row-level
-  // (one per matching chat item) so they map 1:1 onto chatItems indices, and
-  // they cover text a row only reveals once expanded — a collapsed tool use's
-  // command/output, a sub-agent group's children (see lib/chat-search.ts).
+  // sees Virtuoso's rendered rows; this searches the display items and uses
+  // scrollToIndex to reach off-screen hits. Tool and sub-agent groups stay
+  // searchable while collapsed (their text appears on expand, and stepping to
+  // a hit opens them). A folded turn contributes nothing until the reader
+  // expands it, so the counter never promises an off-screen hit; expanded
+  // folds flatten back to their children, which keep their message keys.
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findActive, setFindActive] = useState(0);
@@ -1631,55 +1717,106 @@ function AgentInstanceContent() {
   // from, or a trailing space would count hits it then fails to highlight.
   const findNeedle = findQuery.trim();
 
+  const findScopeItems = useMemo(
+    () => getItemsInSearchScope(displayItems, (key) => expandedToolItems.has(key)),
+    [displayItems, expandedToolItems],
+  );
+
+  // Chat-item key (message id) for each display row, with folded children
+  // pointing back at their summary row. Scrolling a child hit therefore lands
+  // on the fold that contains it.
+  const displayIndexByChatKey = useMemo(
+    () => buildDisplayIndexByKey(displayItems),
+    [displayItems],
+  );
+
   const findMatches = useMemo(() => {
     const needle = findNeedle.toLowerCase();
-    if (!findOpen || !needle) return [] as number[];
+    if (!findOpen || !needle) return [] as string[];
     const itemsAgentType = resolveAgentType(instance?.agent_type_name || undefined);
-    const hits: number[] = [];
-    chatItems.forEach((item, index) => {
-      if (getChatItemSearchText(item, itemsAgentType).toLowerCase().includes(needle)) {
-        hits.push(index);
-      }
-    });
-    return hits;
-  }, [chatItems, findNeedle, findOpen, instance?.agent_type_name]);
+    return findScopeItems
+      .filter((item) =>
+        getChatItemSearchText(item, itemsAgentType).toLowerCase().includes(needle),
+      )
+      .map((item) => item.key);
+  }, [findScopeItems, findNeedle, findOpen, instance?.agent_type_name]);
 
   // Chat-item key (== message id) of the focused match, for the active-row glow.
   const findActiveKey =
     findMatches.length > 0
-      ? chatItems[findMatches[Math.min(findActive, findMatches.length - 1)]]?.key ?? null
+      ? findMatches[Math.min(findActive, findMatches.length - 1)]
       : null;
 
-  // Stepping onto a match that lives inside a collapsed group expands it, so
-  // the hit the counter promised is actually on screen (Chrome does the same
-  // for <details>). Left expanded afterwards — re-collapsing as you step past
-  // would resize rows under the scroll anchor.
+  // Stepping onto a match that lives inside a collapsed tool/sub-agent group
+  // expands it, so the hit the counter promised is actually on screen (Chrome
+  // does the same for <details>). Turn folds are never auto-opened — their
+  // contents are out of scope until the reader opens them. Left expanded
+  // afterwards — re-collapsing as you step past would resize rows under the
+  // scroll anchor.
   useEffect(() => {
     if (!findOpen || !findActiveKey) return;
-    const target = findMatches[Math.min(findActive, findMatches.length - 1)];
-    const activeItem = target === undefined ? undefined : chatItems[target];
-    if (!activeItem || (activeItem.type !== 'tool-group' && activeItem.type !== 'subagent-group')) return;
-    if (expandedToolItems.has(findActiveKey)) return;
-    setExpandedToolItems((prev) => new Set(prev).add(findActiveKey));
-    // Expanding grows the row by its whole detail, so recenter once it has
-    // painted — otherwise the hit can land below the fold.
-    const frame = requestAnimationFrame(() =>
-      virtuosoRef.current?.scrollToIndex({ index: target, align: 'center' }),
-    );
-    return () => cancelAnimationFrame(frame);
-  }, [findOpen, findActiveKey, findActive, findMatches, chatItems, expandedToolItems]);
+    const activeItem = findScopeItems.find((item) => item.key === findActiveKey);
+    if (!activeItem) return;
+    if (
+      (activeItem.type === 'tool-group' || activeItem.type === 'subagent-group') &&
+      !expandedToolItems.has(activeItem.key)
+    ) {
+      setExpandedToolItems((prev) => new Set(prev).add(activeItem.key));
+      // Expanding grows the row by its whole detail, so recenter once it has
+      // painted — otherwise the hit can land below the fold.
+      const frame = requestAnimationFrame(() => {
+        scrollFindHitIntoView(activeItem.key);
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [findOpen, findActiveKey, expandedToolItems, findScopeItems]);
 
-  const scrollToMatch = useCallback(
-    (matchIndex: number) => {
-      const target = findMatches[matchIndex];
-      if (target === undefined) return;
+  /**
+   * Jump to one match. A hit inside a folded turn is scrolled by DOM element:
+   * if the fold is already mounted we never call `scrollToIndex` (it is applied
+   * asynchronously and would later override the element scroll, pushing the
+   * hit back to the fold's centre); if it is not mounted yet we use
+   * `scrollToIndex` once to mount it, then scroll the element into view.
+   */
+  const scrollToMatchKey = useCallback(
+    (matchKey: string, behavior: 'auto' | 'smooth' = 'auto') => {
+      const index = displayIndexByChatKey.get(matchKey);
+      if (index === undefined) return;
       // Detach from the bottom BEFORE scrolling so the measurement-driven
       // atBottomStateChange doesn't yank us back down (it re-sticks only while
       // followBottomRef is still true).
       setFollowBottom(false);
-      virtuosoRef.current?.scrollToIndex({ index: target, align: 'center', behavior: 'smooth' });
+      if (!isFoldedTurnChild(displayItems, matchKey)) {
+        virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior });
+        return;
+      }
+      if (!scrollFindHitIntoView(matchKey)) {
+        // Defer the index scroll a frame: called synchronously from the
+        // query-change effect it can land before Virtuoso has committed the
+        // render and be dropped, leaving a far-away, unmounted fold unscrolled.
+        requestAnimationFrame(() => {
+          virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' });
+          // The index scroll mounts the fold asynchronously. Retry the element
+          // scroll on later frames — at this point the row does not exist yet,
+          // and one immediate retry always lands before Virtuoso mounts it.
+          const retryMount = (attempt: number) => {
+            if (scrollFindHitIntoView(matchKey) || attempt >= 10) return;
+            requestAnimationFrame(() => retryMount(attempt + 1));
+          };
+          requestAnimationFrame(() => retryMount(0));
+        });
+      }
     },
-    [findMatches, setFollowBottom],
+    [displayIndexByChatKey, displayItems, setFollowBottom],
+  );
+
+  const scrollToMatch = useCallback(
+    (matchIndex: number) => {
+      const matchKey = findMatches[matchIndex];
+      if (matchKey === undefined) return;
+      scrollToMatchKey(matchKey, 'smooth');
+    },
+    [findMatches, scrollToMatchKey],
   );
 
   const gotoRelativeMatch = useCallback(
@@ -1723,10 +1860,16 @@ function AgentInstanceContent() {
     prevFindQueryRef.current = findQuery;
     setFindActive(0);
     if (findMatches.length > 0) {
-      setFollowBottom(false);
-      virtuosoRef.current?.scrollToIndex({ index: findMatches[0], align: 'center' });
+      // Next frame: this effect runs in the same commit as the find-bar render,
+      // and Virtuoso drops an index scroll issued before it has processed that
+      // commit (the far-away-hit case). The guard drops the frame if the user
+      // typed on in the meantime.
+      requestAnimationFrame(() => {
+        if (prevFindQueryRef.current !== findQuery) return;
+        scrollToMatchKey(findMatches[0]);
+      });
     }
-  }, [findQuery, findOpen, findMatches, setFollowBottom]);
+  }, [findQuery, findOpen, findMatches, scrollToMatchKey]);
 
   // ⌘F / Ctrl+F opens the bar and preempts the browser's native find (which is
   // defeated by virtualization). Capture phase + preventDefault suppresses it.
@@ -1897,7 +2040,7 @@ function AgentInstanceContent() {
     // first-paint holdback when the first message finally lands.
     if (!hasMessageItems || viewReadyRef.current) return;
     armStabilize();
-  }, [chatItems.length, hasMessageItems, armStabilize]);
+  }, [displayItems.length, hasMessageItems, armStabilize]);
 
   useEffect(() => {
     setFollowBottom(true);
@@ -2687,7 +2830,7 @@ function AgentInstanceContent() {
             key={instanceId}
             ref={virtuosoRef}
             scrollerRef={handleScrollerRef}
-            data={chatItems}
+            data={displayItems}
             // overscroll-none kills the rubber-band/bounce when scrolling past
             // the last message (contain only stops chaining, not the bounce).
             className="absolute inset-0 overscroll-none [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-corner]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-thumb]:rounded-full dark:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/20"
@@ -2695,7 +2838,7 @@ function AgentInstanceContent() {
             // bottom of the viewport on first paint — matches what a real chat
             // window looks like when you open it.
             initialTopMostItemIndex={{
-              index: Math.max(0, chatItems.length - 1),
+              index: Math.max(0, displayItems.length - 1),
               align: 'end',
             }}
             // Rough average row height. Tightening Virtuoso's initial estimate
@@ -2762,6 +2905,7 @@ function AgentInstanceContent() {
                 expandedKeys={expandedToolItems}
                 onToggleExpanded={toggleToolItem}
                 findActiveKey={findActiveKey}
+                vibingMessage={showVibing ? vibingMessage : undefined}
                 onOptionClick={canPrompt ? handleOptionClick : undefined}
                 onAskUserQuestionSubmit={canPrompt ? handleAskUserQuestionSubmit : undefined}
                 onAskUserQuestionCancel={canPrompt ? handleAskUserQuestionCancel : undefined}

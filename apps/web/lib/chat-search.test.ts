@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'vitest';
-import { getChatItemSearchText, getMessageSearchText } from './chat-search';
+import {
+  getChatItemSearchText,
+  getItemsInSearchScope,
+  getMessageSearchText,
+} from './chat-search';
 import type { MessageResponse } from '@/lib/backend-api';
 
 function message(over: Partial<MessageResponse> & { id: string }): MessageResponse {
@@ -67,5 +71,59 @@ describe('getChatItemSearchText', () => {
   test('separators and the thinking indicator carry nothing', () => {
     expect(getChatItemSearchText({ type: 'separator' }, 'claude')).toBe('');
     expect(getChatItemSearchText({ type: 'thinking' }, 'claude')).toBe('');
+  });
+
+  test('a folded-turn summary row carries nothing itself', () => {
+    expect(getChatItemSearchText({ type: 'turn-activity' }, 'claude')).toBe('');
+  });
+});
+
+describe('getItemsInSearchScope', () => {
+  const prompt = { key: 'u1', type: 'message' };
+  const tool = { key: 'tools-t1', type: 'tool-group' };
+  const folded = {
+    key: 'turn-activity-tools-t1',
+    type: 'turn-activity',
+    items: [tool, { key: 'm2', type: 'message' }],
+  };
+  const answer = { key: 'm3', type: 'message' };
+
+  test('keeps ordinary rows in order', () => {
+    expect(getItemsInSearchScope([prompt, tool, answer], () => false)).toEqual([
+      prompt,
+      tool,
+      answer,
+    ]);
+  });
+
+  test('a collapsed fold contributes nothing', () => {
+    expect(getItemsInSearchScope([prompt, folded, answer], () => false)).toEqual([
+      prompt,
+      answer,
+    ]);
+  });
+
+  test('an expanded fold flattens its children in their original order', () => {
+    expect(
+      getItemsInSearchScope([prompt, folded, answer], (key) => key === folded.key),
+    ).toEqual([prompt, tool, { key: 'm2', type: 'message' }, answer]);
+  });
+
+  test('expansion is decided per key, not globally', () => {
+    const otherFold = {
+      key: 'turn-activity-tools-t9',
+      type: 'turn-activity',
+      items: [{ key: 'tools-t9', type: 'tool-group' }],
+    };
+    const items = getItemsInSearchScope(
+      [folded, otherFold],
+      (key) => key === folded.key,
+    );
+    expect(items.map((item) => item.key)).toEqual(['tools-t1', 'm2']);
+  });
+
+  test('tool groups stay in scope whether collapsed or expanded', () => {
+    expect(getItemsInSearchScope([tool], () => false)).toEqual([tool]);
+    expect(getItemsInSearchScope([tool], () => true)).toEqual([tool]);
   });
 });
