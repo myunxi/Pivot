@@ -12,6 +12,7 @@ import { DesktopAuthHandoff } from '@/components/dashboard/desktop-auth-handoff'
 import { DesktopWindowControls } from '@/components/desktop/window-chrome';
 import { DirectPairingGate } from '@/components/direct/direct-pairing-gate';
 import { DirectPwa } from '@/components/direct/direct-pwa';
+import { manifestMetadata } from '@/lib/direct-installability';
 import {
   DIRECT_API_BASE_KEY,
   DIRECT_TOKEN_KEY,
@@ -49,7 +50,6 @@ export const metadata: Metadata = {
     { rel: 'icon', url: '/favicon-512x512.png', sizes: '512x512', type: 'image/png' },
     { rel: 'apple-touch-icon', url: '/favicon-apple.png', sizes: '180x180' },
   ],
-  manifest: '/manifest.json',
   keywords: [
     'Vicoa',
     'Vicoa app',
@@ -135,6 +135,7 @@ export const metadata: Metadata = {
   category: 'technology',
   classification: 'Developer Tools',
   applicationName: 'Vicoa',
+  ...manifestMetadata(IS_DIRECT_WEB),
   ...(IS_DIRECT_WEB ? { appleWebApp: DIRECT_APPLE_WEB_APP } : {}),
   referrer: 'origin-when-cross-origin',
   formatDetection: {
