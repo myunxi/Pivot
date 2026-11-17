@@ -55,10 +55,11 @@ Issues = "https://github.com/vicoa-ai/vicoa/issues"
 
 [project.scripts]
 vicoa = "vicoa.cli:main"
+pivot = "pivot.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["vicoa*", "protocol*", "servers.mcp*", "servers.shared*", "integrations*"]
+include = ["vicoa*", "pivot*", "protocol*", "servers.mcp*", "servers.shared*", "integrations*"]
 
 [tool.setuptools.package-data]
 vicoa = ["_bin/**"]

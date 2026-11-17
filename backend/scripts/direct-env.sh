@@ -55,3 +55,27 @@ export VICOA_DIRECT_WITH_WEB
 export VICOA_DIRECT_SHOW_TOKEN
 export VICOA_DIRECT_PUBLIC_URL
 export VICOA_DIRECT_LOG_FILE="$VICOA_DIRECT_LOG_DIR/daemon.log"
+
+# Pivot orchestration layer (dispatch API + cron pump). It reuses the direct
+# nonce by default; override PIVOT_TOKEN_PATH to keep credentials separate.
+: "${PIVOT_DATA_DIR:=$HOME/.pivot}"
+: "${PIVOT_RULES_PATH:=$PIVOT_DATA_DIR/rules.json}"
+: "${PIVOT_STORE:=$PIVOT_DATA_DIR/store.db}"
+: "${PIVOT_SERVE_HOST:=127.0.0.1}"
+: "${PIVOT_SERVE_PORT:=8787}"
+: "${PIVOT_DAEMON_URL:=http://127.0.0.1:$VICOA_DIRECT_PORT}"
+: "${PIVOT_TOKEN_PATH:=$VICOA_DIRECT_TOKEN_PATH}"
+: "${PIVOT_LOG_DIR:=$PIVOT_DATA_DIR/logs}"
+: "${PIVOT_PID_FILE:=$PIVOT_DATA_DIR/serve.pid}"
+: "${PIVOT_LOG_FILE:=$PIVOT_LOG_DIR/serve.log}"
+
+export PIVOT_DATA_DIR
+export PIVOT_RULES_PATH
+export PIVOT_STORE
+export PIVOT_SERVE_HOST
+export PIVOT_SERVE_PORT
+export PIVOT_DAEMON_URL
+export PIVOT_TOKEN_PATH
+export PIVOT_LOG_DIR
+export PIVOT_PID_FILE
+export PIVOT_LOG_FILE
