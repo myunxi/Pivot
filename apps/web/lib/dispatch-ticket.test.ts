@@ -57,7 +57,6 @@ describe('formFieldsFromTicket', () => {
       eventType: 'demo',
       subject: 'Investigate',
       detail: 'Short summary\n\nFull detail',
-      link: 'https://example.com',
     });
   });
 
@@ -77,11 +76,5 @@ describe('formFieldsFromTicket', () => {
 
   test('returns null when the ticket has no event', () => {
     expect(formFieldsFromTicket(detail({ event: null }), ['demo-rule'])).toBeNull();
-  });
-
-  test('never backfills the dedupe key', () => {
-    const fields = formFieldsFromTicket(detail(), ['demo-rule']);
-
-    expect(fields).not.toHaveProperty('dedupeKey');
   });
 });

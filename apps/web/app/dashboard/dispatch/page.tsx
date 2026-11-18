@@ -125,8 +125,6 @@ export default function DispatchPage() {
   const [eventType, setEventType] = useState('');
   const [subject, setSubject] = useState('');
   const [detail, setDetail] = useState('');
-  const [link, setLink] = useState('');
-  const [dedupeKey, setDedupeKey] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmingDelete, setConfirmingDelete] = useState(false);
 
@@ -202,8 +200,6 @@ export default function DispatchPage() {
       if (draft.eventType) setEventType(draft.eventType);
       setSubject(draft.subject);
       setDetail(draft.detail);
-      setLink(draft.link);
-      setDedupeKey(draft.dedupeKey);
     }
     setDraftReady(true);
   }, []);
@@ -258,10 +254,8 @@ export default function DispatchPage() {
       eventType,
       subject,
       detail,
-      link,
-      dedupeKey,
     });
-  }, [draftReady, selectedRule, eventType, subject, detail, link, dedupeKey]);
+  }, [draftReady, selectedRule, eventType, subject, detail]);
 
   const selectRule = useCallback(
     (value: string) => {
@@ -295,8 +289,6 @@ export default function DispatchPage() {
         type,
         subject: subject.trim() || undefined,
         detail: detail.trim() || undefined,
-        link: link.trim() || undefined,
-        key: dedupeKey.trim() || undefined,
       });
       if (response.status === 'failed') {
         setOutcome({ kind: 'error', message: response.error ?? 'Dispatch failed.' });
@@ -306,8 +298,6 @@ export default function DispatchPage() {
       if (response.status === 'running' || response.status === 'deferred') {
         setSubject('');
         setDetail('');
-        setLink('');
-        setDedupeKey('');
         void loadTickets(true);
       }
     } catch (error) {
@@ -337,8 +327,6 @@ export default function DispatchPage() {
       setEventType(fields.eventType);
       setSubject(fields.subject);
       setDetail(fields.detail);
-      setLink(fields.link);
-      // Dedupe key is intentionally left alone.
       if (fields.rule === null) {
         setBackfillNotice(
           'The rule no longer exists; the other fields were filled in.',
@@ -529,26 +517,6 @@ export default function DispatchPage() {
                   onChange={(event) => setDetail(event.target.value)}
                   placeholder="Task instructions the agent reads from input.md"
                   className="min-h-32 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/60 focus-visible:ring-[1px]"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="dispatch-link">Link</Label>
-                <Input
-                  id="dispatch-link"
-                  value={link}
-                  onChange={(event) => setLink(event.target.value)}
-                  placeholder="https://…"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="dispatch-dedupe">Dedupe key</Label>
-                <Input
-                  id="dispatch-dedupe"
-                  value={dedupeKey}
-                  onChange={(event) => setDedupeKey(event.target.value)}
-                  placeholder="Optional; the same key never creates two tickets"
                 />
               </div>
 

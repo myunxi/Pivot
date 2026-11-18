@@ -3,8 +3,7 @@
  *
  * Manual events with no subject get the event type as their subject on the
  * backend; showing that as a user-written title would invent one, so an equal
- * value is treated as "not filled". The dedupe key is deliberately never
- * restored: reusing an old key would make the next dispatch a duplicate.
+ * value is treated as "not filled".
  */
 
 import type { PivotTicketDetail } from '@/lib/pivot-api';
@@ -14,7 +13,6 @@ export interface TicketFormFields {
   eventType: string;
   subject: string;
   detail: string;
-  link: string;
 }
 
 export function joinBody(
@@ -43,6 +41,5 @@ export function formFieldsFromTicket(
     eventType: event.type,
     subject: event.subject === event.type ? '' : (event.subject ?? ''),
     detail: joinBody(event.summary, event.detail),
-    link: event.link ?? '',
   };
 }

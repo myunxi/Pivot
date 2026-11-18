@@ -31,8 +31,6 @@ const draft: DispatchDraft = {
   eventType: 'demo',
   subject: 'Investigate',
   detail: 'Body',
-  link: 'https://example.com',
-  dedupeKey: 'key-1',
 };
 
 describe('loadDispatchDraft', () => {

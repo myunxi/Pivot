@@ -11,8 +11,6 @@ export interface DispatchDraft {
   eventType: string;
   subject: string;
   detail: string;
-  link: string;
-  dedupeKey: string;
 }
 
 export interface DraftStorage {
@@ -28,8 +26,6 @@ export const EMPTY_DISPATCH_DRAFT: DispatchDraft = {
   eventType: '',
   subject: '',
   detail: '',
-  link: '',
-  dedupeKey: '',
 };
 
 const DRAFT_FIELDS = [
@@ -37,8 +33,6 @@ const DRAFT_FIELDS = [
   'eventType',
   'subject',
   'detail',
-  'link',
-  'dedupeKey',
 ] as const;
 
 function browserSessionStorage(): DraftStorage | null {
